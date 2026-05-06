@@ -1,0 +1,7 @@
+.DS_Store
+node_modules/
+*.log
+.idea/
+
+# 私有域名映射（不纳入版本控制）
+cases/_private_mapping.json

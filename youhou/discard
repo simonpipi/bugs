@@ -1,0 +1,923 @@
+// ==UserScript==
+// @name         Discord 图片助手v222
+// @namespace    http://tampermonkey.net/
+// @version      1.4
+// @description  该脚本为 Discord 网页版中的图片添加“保存原图”和“手动批量下载”按钮。
+// @author       Your Name
+// @match        https://discord.com/*
+// @grant        GM_download
+// @grant        GM_setClipboard
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// @require      https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
+// @run-at       document-idle
+// @license      MIT
+// @downloadURL https://update.greasyfork.org/scripts/536492/Discord%20%E5%9B%BE%E7%89%87%E5%8A%A9%E6%89%8B.user.js
+// @updateURL https://update.greasyfork.org/scripts/536492/Discord%20%E5%9B%BE%E7%89%87%E5%8A%A9%E6%89%8B.meta.js
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const PROCESSED_TARGET_MARKER = 'data-image-enhancer-target-processed';
+    const BUTTON_CONTAINER_CLASS = 'custom-image-buttons-container';
+    const GLOBAL_ACTIONS_ID = 'custom-global-image-actions';
+    const GLOBAL_STATUS_ID = 'custom-global-image-status';
+    const GLOBAL_DOWNLOAD_LINK_ID = 'custom-global-download-link';
+    const GLOBAL_COPY_LINK_BUTTON_ID = 'custom-global-copy-link-button';
+    const DOWNLOAD_FILE_PREFIX = 'discord_image';
+    const ZIP_FILE_PREFIX = 'discord_images';
+    const SCAN_DEBOUNCE_MS = 180;
+    const BULK_DOWNLOAD_INTERVAL_MS = 800;
+
+    const imageParentSelectors = [
+        'div[class*="*visualMediaItemContainer"]',
+        'div[class*="f4758a8d6346d18b-oneByTwoGrid"]',
+        'div[class*="imageContainer-"]',
+        'div[class*="imageWrapper-"]',
+        'div[class*="imageWrapper"]',
+        'div[class*="twoByOneGridItem_"]',
+        'div[class*="f4758a8d6346d18b-twoByOneGridItem"]',
+        'div[class*="clickableWrapper-"]',
+        'div[class*="embedMedia-"]',
+        'div[class*="attachmentContentContainer-"]',
+        'div[class*="mediaMosaicSrc-"]',
+        'div[class*="mediaAttachmentsContainer-"]',
+        'div[class*="messageAttachment-"]',
+        'figure[class*="imageContainer-"]'
+    ];
+
+    const imageWrapperSelector = imageParentSelectors.join(', ');
+    let scanTimer = null;
+
+    function logInfo(...args) {
+        console.log('[Discord图片助手]', ...args);
+    }
+
+    function logError(...args) {
+        console.error('[Discord图片助手]', ...args);
+    }
+
+    function ensureStatusBox() {
+        let statusBox = document.getElementById(GLOBAL_STATUS_ID);
+        if (statusBox) {
+            return statusBox;
+        }
+
+        statusBox = document.createElement('div');
+        statusBox.id = GLOBAL_STATUS_ID;
+        statusBox.className = 'custom-global-image-status';
+        document.body.appendChild(statusBox);
+        return statusBox;
+    }
+
+    function ensureManualDownloadLink() {
+        let downloadLink = document.getElementById(GLOBAL_DOWNLOAD_LINK_ID);
+        if (downloadLink) {
+            return downloadLink;
+        }
+
+        downloadLink = document.createElement('a');
+        downloadLink.id = GLOBAL_DOWNLOAD_LINK_ID;
+        downloadLink.className = 'custom-global-download-link';
+        downloadLink.target = '_blank';
+        downloadLink.rel = 'noopener';
+        downloadLink.style.display = 'none';
+        downloadLink.textContent = '点击这里保存压缩包';
+        document.body.appendChild(downloadLink);
+        return downloadLink;
+    }
+
+    function ensureCopyLinkButton() {
+        let copyButton = document.getElementById(GLOBAL_COPY_LINK_BUTTON_ID);
+        if (copyButton) {
+            return copyButton;
+        }
+
+        copyButton = document.createElement('button');
+        copyButton.id = GLOBAL_COPY_LINK_BUTTON_ID;
+        copyButton.className = 'custom-global-copy-link-button';
+        copyButton.style.display = 'none';
+        copyButton.textContent = '复制压缩包链接';
+        document.body.appendChild(copyButton);
+        return copyButton;
+    }
+
+    function showManualDownloadLink(objectUrl, fileName) {
+        const downloadLink = ensureManualDownloadLink();
+        downloadLink.href = objectUrl;
+        downloadLink.download = fileName;
+        downloadLink.textContent = `点击保存压缩包：${fileName}`;
+        downloadLink.style.display = 'block';
+        logInfo('已显示手动保存链接', fileName);
+
+        const copyButton = ensureCopyLinkButton();
+        copyButton.style.display = 'block';
+        copyButton.onclick = async () => {
+            try {
+                await navigator.clipboard.writeText(objectUrl);
+                showStatus('压缩包链接已复制，可粘贴到新标签页打开', 'success', 4000);
+                logInfo('已复制压缩包链接', objectUrl);
+            } catch (error) {
+                if (typeof GM_setClipboard === 'function') {
+                    GM_setClipboard(objectUrl);
+                    showStatus('压缩包链接已复制到剪贴板', 'success', 4000);
+                    logInfo('已通过 GM_setClipboard 复制压缩包链接', objectUrl);
+                    return;
+                }
+                showStatus('复制链接失败，请直接点击保存链接', 'error', 4000);
+                logError('复制压缩包链接失败', error);
+            }
+        };
+    }
+
+    function hideManualDownloadLink() {
+        const downloadLink = document.getElementById(GLOBAL_DOWNLOAD_LINK_ID);
+        if (!downloadLink) {
+            return;
+        }
+        downloadLink.style.display = 'none';
+        downloadLink.removeAttribute('href');
+        downloadLink.removeAttribute('download');
+
+        const copyButton = document.getElementById(GLOBAL_COPY_LINK_BUTTON_ID);
+        if (copyButton) {
+            copyButton.style.display = 'none';
+            copyButton.onclick = null;
+        }
+    }
+
+    function showStatus(message, type = 'info', autoHideMs = 0) {
+        const statusBox = ensureStatusBox();
+        statusBox.textContent = message;
+        statusBox.setAttribute('data-status-type', type);
+        statusBox.classList.add('is-visible');
+        logInfo(message);
+
+        if (showStatus.timer) {
+            clearTimeout(showStatus.timer);
+            showStatus.timer = null;
+        }
+
+        if (autoHideMs > 0) {
+            showStatus.timer = setTimeout(() => {
+                statusBox.classList.remove('is-visible');
+            }, autoHideMs);
+        }
+    }
+
+    function openBlobInNewTab(objectUrl) {
+        try {
+            const popup = window.open(objectUrl, '_blank', 'noopener,noreferrer');
+            if (popup) {
+                logInfo('已打开新标签页兜底下载');
+                return true;
+            }
+        } catch (error) {
+            logError('window.open 兜底失败', error);
+        }
+        return false;
+    }
+
+    function triggerBrowserDownload(blob, fileName) {
+        const objectUrl = URL.createObjectURL(blob);
+        showManualDownloadLink(objectUrl, fileName);
+        const downloadLink = document.createElement('a');
+        downloadLink.href = objectUrl;
+        downloadLink.download = fileName;
+        downloadLink.rel = 'noopener';
+        downloadLink.style.display = 'none';
+
+        document.body.appendChild(downloadLink);
+        logInfo('准备触发浏览器下载', fileName);
+        downloadLink.click();
+        logInfo('已执行 downloadLink.click()', fileName);
+        openBlobInNewTab(objectUrl);
+
+        setTimeout(() => {
+            downloadLink.remove();
+        }, 3000);
+
+        return objectUrl;
+    }
+
+    function sanitizeFileName(fileName) {
+        return fileName.replace(/[\\/:*?"<>|]+/g, '_');
+    }
+
+    function splitBaseNameAndExtension(fileName) {
+        const lastDotIndex = fileName.lastIndexOf('.');
+        if (lastDotIndex <= 0 || lastDotIndex === fileName.length - 1) {
+            return { baseName: fileName, extension: '' };
+        }
+        return {
+            baseName: fileName.slice(0, lastDotIndex),
+            extension: fileName.slice(lastDotIndex + 1)
+        };
+    }
+
+    function getExtensionFromContentType(contentType) {
+        const normalized = (contentType || '').toLowerCase();
+        if (normalized.includes('jpeg')) return 'jpg';
+        if (normalized.includes('png')) return 'png';
+        if (normalized.includes('gif')) return 'gif';
+        if (normalized.includes('webp')) return 'webp';
+        if (normalized.includes('avif')) return 'avif';
+        if (normalized.includes('bmp')) return 'bmp';
+        if (normalized.includes('svg')) return 'svg';
+        return 'jpg';
+    }
+
+    function getFileNameFromUrl(url, fallbackIndex, blob) {
+        try {
+            const parsedUrl = new URL(url);
+            const pathName = parsedUrl.pathname || '';
+            const rawFileName = pathName.split('/').pop() || `${DOWNLOAD_FILE_PREFIX}_${fallbackIndex}`;
+            const decodedFileName = decodeURIComponent(rawFileName);
+            const sanitizedOriginalName = sanitizeFileName(decodedFileName);
+            const { baseName, extension } = splitBaseNameAndExtension(sanitizedOriginalName);
+
+            if (extension) {
+                return `${baseName}.${extension.toLowerCase()}`;
+            }
+
+            return `${baseName}.${getExtensionFromContentType(blob && blob.type)}`;
+        } catch (error) {
+            return `${DOWNLOAD_FILE_PREFIX}_${fallbackIndex}.${getExtensionFromContentType(blob && blob.type)}`;
+        }
+    }
+
+    async function fetchImageAsBlob(url) {
+        logInfo('开始抓取图片', url);
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`下载失败: ${response.status} ${response.statusText}`);
+        }
+        logInfo('图片抓取成功', url, response.headers.get('content-type') || 'unknown');
+        return response.blob();
+    }
+
+    function getImageUrl(element) {
+        if (!element) {
+            return null;
+        }
+        if (element.tagName === 'IMG' && element.src) {
+            return element.src;
+        }
+        if (element.tagName === 'A' && element.href) {
+            const imgElement = element.querySelector('img');
+            if (imgElement && imgElement.src && (imgElement.src.includes('discordapp.com') || imgElement.src.includes('discordapp.net'))) {
+                return imgElement.src;
+            }
+            if (element.href.match(/\.(jpeg|jpg|gif|png|webp|avif)(#.*)?$/i) || element.href.includes('discordapp.com') || element.href.includes('discordapp.net')) {
+                return element.href;
+            }
+        }
+        if (element.style && element.style.backgroundImage) {
+            const bgImage = element.style.backgroundImage;
+            const match = bgImage.match(/url\("?([^"]+)"?\)/);
+            if (match && match[1]) {
+                return match[1];
+            }
+        }
+        const childImg = element.querySelector('img[src*="cdn.discordapp.com"], img[src*="media.discordapp.net"], img[src*="discordapp.com"], img[src*="discordapp.net"]');
+        if (childImg && childImg.src) {
+            return childImg.src;
+        }
+        return null;
+    }
+
+    function getShareableCdnUrl(url) {
+        if (!url || typeof url !== 'string') {
+            return null;
+        }
+        try {
+            const originalUrl = new URL(url);
+            const cdnHostname = 'cdn.discordapp.com';
+            let finalPathname = originalUrl.pathname;
+
+            if (!finalPathname.startsWith('/')) {
+                finalPathname = '/' + finalPathname;
+            }
+
+            let newUrlString = `https://${cdnHostname}${finalPathname}`;
+            const paramsToKeep = ['ex', 'is', 'hm', 'width', 'height', 'size', 'format', 'quality'];
+            const newSearchParams = new URLSearchParams();
+
+            paramsToKeep.forEach((paramName) => {
+                if (originalUrl.searchParams.has(paramName)) {
+                    originalUrl.searchParams.getAll(paramName).forEach((value) => {
+                        newSearchParams.append(paramName, value);
+                    });
+                }
+            });
+
+            const searchString = newSearchParams.toString();
+            if (searchString) {
+                newUrlString += `?${searchString}`;
+            }
+
+            return newUrlString;
+        } catch (error) {
+            console.error('Error creating shareable CDN URL from:', url, error);
+            return url;
+        }
+    }
+
+    function getAllImageUrlsManually() {
+        const wrappers = document.querySelectorAll(imageWrapperSelector);
+        const urlSet = new Set();
+
+        wrappers.forEach((wrapper) => {
+            const elementForUrlExtraction =
+                wrapper.querySelector('img[src*="discordapp.com"], img[src*="discordapp.net"]') ||
+                wrapper.querySelector('a[href*="discordapp.com"], a[href*="discordapp.net"]') ||
+                wrapper;
+
+            const currentDetectedUrlInDom = getImageUrl(elementForUrlExtraction);
+            const shareableCdnUrl = getShareableCdnUrl(currentDetectedUrlInDom);
+            if (shareableCdnUrl) {
+                urlSet.add(shareableCdnUrl);
+            }
+        });
+
+        return Array.from(urlSet);
+    }
+
+    function wait(delay) {
+        return new Promise((resolve) => setTimeout(resolve, delay));
+    }
+
+    async function downloadAllImages(button) {
+        const imageUrls = getAllImageUrlsManually();
+        if (!imageUrls.length) {
+            alert('当前页面没有检测到可下载图片。');
+            return;
+        }
+
+        const originalText = button.innerHTML;
+        button.disabled = true;
+
+        let completed = 0;
+        let failed = 0;
+
+        for (let index = 0; index < imageUrls.length; index += 1) {
+            const url = imageUrls[index];
+            button.innerHTML = `批量下载 ${index + 1}/${imageUrls.length}`;
+            try {
+                const fileName = getFileNameFromUrl(url, index + 1);
+                GM_download({
+                    url,
+                    name: fileName,
+                    saveAs: false
+                });
+                completed += 1;
+            } catch (error) {
+                failed += 1;
+                console.error('批量下载失败:', url, error);
+            }
+            await wait(BULK_DOWNLOAD_INTERVAL_MS);
+        }
+
+        button.innerHTML = failed > 0 ? `已下载 ${completed}，失败 ${failed}` : `已下载 ${completed} 张`;
+        setTimeout(() => {
+            button.innerHTML = originalText;
+            button.disabled = false;
+        }, 2500);
+    }
+
+    function getTimestampText() {
+        const now = new Date();
+        const parts = [
+            now.getFullYear(),
+            String(now.getMonth() + 1).padStart(2, '0'),
+            String(now.getDate()).padStart(2, '0'),
+            String(now.getHours()).padStart(2, '0'),
+            String(now.getMinutes()).padStart(2, '0'),
+            String(now.getSeconds()).padStart(2, '0')
+        ];
+        return parts.join('');
+    }
+
+    async function convertBlobToUint8Array(blob) {
+        const arrayBuffer = await blob.arrayBuffer();
+        return new Uint8Array(arrayBuffer);
+    }
+
+    function buildZipBlobWithFflate(fileMap) {
+        if (typeof fflate === 'undefined' || typeof fflate.zipSync !== 'function') {
+            throw new Error('fflate 不可用');
+        }
+        const zippedData = fflate.zipSync(fileMap, { level: 0 });
+        return new Blob([zippedData], { type: 'application/zip' });
+    }
+
+    async function buildZipBlobWithJsZip(fileMap) {
+        if (typeof JSZip === 'undefined') {
+            throw new Error('JSZip 不可用');
+        }
+        const zip = new JSZip();
+        Object.entries(fileMap).forEach(([fileName, fileData]) => {
+            zip.file(fileName, fileData, {
+                binary: true,
+                compression: 'STORE'
+            });
+        });
+        await wait(0);
+        return zip.generateAsync({
+            type: 'blob',
+            compression: 'STORE',
+            streamFiles: true
+        });
+    }
+
+    async function downloadImagesAsZip(button) {
+        hideManualDownloadLink();
+        const imageUrls = getAllImageUrlsManually();
+        if (!imageUrls.length) {
+            alert('当前页面没有检测到可打包图片。');
+            return;
+        }
+
+        if (typeof fflate === 'undefined' && typeof JSZip === 'undefined') {
+            alert('ZIP 依赖加载失败，暂时无法打包下载。');
+            return;
+        }
+
+        const originalText = button.innerHTML;
+        button.disabled = true;
+        showStatus(`准备打包，共 ${imageUrls.length} 张图片`, 'info');
+        logInfo('开始 ZIP 打包', { total: imageUrls.length });
+
+        const fileMap = {};
+        const usedFileNames = new Set();
+        let completed = 0;
+        let failed = 0;
+        let totalBytes = 0;
+
+        for (let index = 0; index < imageUrls.length; index += 1) {
+            const url = imageUrls[index];
+            button.innerHTML = `打包中 ${index + 1}/${imageUrls.length}`;
+            showStatus(`正在抓取第 ${index + 1}/${imageUrls.length} 张图片`, 'info');
+            try {
+                const blob = await fetchImageAsBlob(url);
+                const uint8Array = await convertBlobToUint8Array(blob);
+                let fileName = getFileNameFromUrl(url, index + 1, blob);
+                logInfo('解析出的文件名', fileName, '来源', url);
+
+                if (usedFileNames.has(fileName)) {
+                    const dotIndex = fileName.lastIndexOf('.');
+                    const baseName = dotIndex >= 0 ? fileName.slice(0, dotIndex) : fileName;
+                    const extension = dotIndex >= 0 ? fileName.slice(dotIndex) : '';
+                    fileName = `${baseName}_${index + 1}${extension}`;
+                }
+
+                usedFileNames.add(fileName);
+                fileMap[fileName] = uint8Array;
+                completed += 1;
+                totalBytes += blob.size;
+                logInfo(`已加入压缩包 ${completed}/${imageUrls.length}`, fileName, `${blob.size} bytes`);
+            } catch (error) {
+                failed += 1;
+                logError('打包下载失败:', url, error);
+                showStatus(`第 ${index + 1} 张抓取失败，继续处理其余图片`, 'error');
+            }
+        }
+
+        if (!completed) {
+            button.innerHTML = '打包失败';
+            showStatus('所有图片抓取失败，未生成压缩包', 'error', 4000);
+            setTimeout(() => {
+                button.innerHTML = originalText;
+                button.disabled = false;
+            }, 2500);
+            return;
+        }
+
+        button.innerHTML = '生成压缩包...';
+        showStatus(`图片抓取完成，开始生成 ZIP（成功 ${completed}，失败 ${failed}）`, failed > 0 ? 'warning' : 'info');
+        logInfo('开始生成 ZIP Blob', { completed, failed, totalBytes });
+
+        try {
+            let zipBlob = null;
+            if (typeof fflate !== 'undefined' && typeof fflate.zipSync === 'function') {
+                button.innerHTML = '备用引擎打包中...';
+                showStatus('正在使用备用 ZIP 引擎打包...', 'info');
+                logInfo('使用 fflate 生成 ZIP');
+                zipBlob = buildZipBlobWithFflate(fileMap);
+            } else {
+                button.innerHTML = 'JSZip 打包中...';
+                showStatus('正在使用 JSZip 打包...', 'warning');
+                logInfo('fflate 不可用，回退到 JSZip');
+                zipBlob = await buildZipBlobWithJsZip(fileMap);
+            }
+            const zipFileName = `${ZIP_FILE_PREFIX}_${getTimestampText()}.zip`;
+            showStatus(`压缩包已生成，准备下载：${zipFileName}`, 'success');
+            logInfo('ZIP Blob 生成完成', zipFileName, `${zipBlob.size} bytes`);
+            const objectUrl = triggerBrowserDownload(zipBlob, zipFileName);
+            showStatus(`压缩包下载已触发；若未弹出，请点击保存链接、复制链接或查看新标签页`, 'warning', 10000);
+            logInfo('已通过浏览器下载触发 ZIP 保存', zipFileName);
+            logInfo('压缩包 Blob URL', objectUrl);
+
+            button.innerHTML = failed > 0 ? `已打包 ${completed}，失败 ${failed}` : `已打包 ${completed} 张`;
+        } catch (error) {
+            logError('生成 ZIP 失败:', error);
+            showStatus(`生成压缩包失败：${error && error.message ? error.message : error}`, 'error', 5000);
+            button.innerHTML = '压缩失败';
+        }
+
+        setTimeout(() => {
+            button.innerHTML = originalText;
+            button.disabled = false;
+        }, 2500);
+    }
+
+    function ensureGlobalActions() {
+        let globalActions = document.getElementById(GLOBAL_ACTIONS_ID);
+        if (globalActions) {
+            return globalActions;
+        }
+
+        globalActions = document.createElement('div');
+        globalActions.id = GLOBAL_ACTIONS_ID;
+        globalActions.className = 'custom-global-image-actions';
+
+        const bulkDownloadBtn = document.createElement('button');
+        bulkDownloadBtn.className = 'custom-image-button custom-download-all-button';
+        bulkDownloadBtn.innerHTML = '手动批量下载';
+        bulkDownloadBtn.onclick = async (event) => {
+            event.stopPropagation();
+            event.preventDefault();
+            await downloadAllImages(bulkDownloadBtn);
+        };
+
+        const bulkZipBtn = document.createElement('button');
+        bulkZipBtn.className = 'custom-image-button custom-download-zip-button';
+        bulkZipBtn.innerHTML = '打包下载 ZIP';
+        bulkZipBtn.onclick = async (event) => {
+            event.stopPropagation();
+            event.preventDefault();
+            await downloadImagesAsZip(bulkZipBtn);
+        };
+
+        globalActions.appendChild(bulkDownloadBtn);
+        globalActions.appendChild(bulkZipBtn);
+        document.body.appendChild(globalActions);
+        ensureStatusBox();
+        ensureManualDownloadLink();
+        ensureCopyLinkButton();
+        return globalActions;
+    }
+
+    function createDownloadButton(shareableCdnUrl) {
+        const buttonContainer = document.createElement('div');
+        buttonContainer.className = BUTTON_CONTAINER_CLASS;
+        buttonContainer.setAttribute('data-image-url', shareableCdnUrl);
+
+        const downloadBtn = document.createElement('button');
+        downloadBtn.innerHTML = '保存原图';
+        downloadBtn.className = 'custom-image-button custom-download-button';
+        downloadBtn.onclick = async (event) => {
+            event.stopPropagation();
+            event.preventDefault();
+            downloadBtn.disabled = true;
+            downloadBtn.innerHTML = '保存中...';
+            try {
+                const blob = await fetchImageAsBlob(shareableCdnUrl);
+                const objectUrl = URL.createObjectURL(blob);
+                const fileName = getFileNameFromUrl(shareableCdnUrl, 1, blob);
+                GM_download({
+                    url: objectUrl,
+                    name: fileName,
+                    saveAs: true,
+                    onload: () => URL.revokeObjectURL(objectUrl),
+                    onerror: () => URL.revokeObjectURL(objectUrl)
+                });
+                setTimeout(() => {
+                    downloadBtn.innerHTML = '已保存!';
+                    downloadBtn.disabled = false;
+                }, 1500);
+            } catch (error) {
+                console.error('单图下载失败:', error);
+                downloadBtn.innerHTML = '保存失败';
+                setTimeout(() => {
+                    downloadBtn.innerHTML = '保存原图';
+                    downloadBtn.disabled = false;
+                }, 1500);
+            }
+        };
+
+        buttonContainer.appendChild(downloadBtn);
+        return buttonContainer;
+    }
+
+    function addButtonsToImageWrapper(imageElementWrapper, originalImageUrl) {
+        if (!imageElementWrapper || imageElementWrapper.getAttribute(PROCESSED_TARGET_MARKER) === 'true') {
+            return;
+        }
+
+        const shareableCdnUrl = getShareableCdnUrl(originalImageUrl);
+        if (!shareableCdnUrl) {
+            return;
+        }
+
+        const parentNode = imageElementWrapper.parentNode;
+        if (!parentNode) {
+            return;
+        }
+
+        const buttonContainer = createDownloadButton(shareableCdnUrl);
+        parentNode.insertBefore(buttonContainer, imageElementWrapper.nextSibling);
+        imageElementWrapper.setAttribute(PROCESSED_TARGET_MARKER, 'true');
+    }
+
+    function resolveWrapperElement(rootNode) {
+        if (!rootNode || rootNode.nodeType !== Node.ELEMENT_NODE) {
+            return null;
+        }
+        if (rootNode.matches && rootNode.matches(imageWrapperSelector)) {
+            return rootNode;
+        }
+        return rootNode.closest ? rootNode.closest(imageWrapperSelector) : null;
+    }
+
+    function scanWrapper(wrapper) {
+        if (!wrapper || wrapper.getAttribute(PROCESSED_TARGET_MARKER) === 'true') {
+            return;
+        }
+
+        const elementForUrlExtraction =
+            wrapper.querySelector('img[src*="discordapp.com"], img[src*="discordapp.net"]') ||
+            wrapper.querySelector('a[href*="discordapp.com"], a[href*="discordapp.net"]') ||
+            wrapper;
+
+        const currentDetectedUrlInDom = getImageUrl(elementForUrlExtraction);
+        if (currentDetectedUrlInDom) {
+            addButtonsToImageWrapper(wrapper, currentDetectedUrlInDom);
+        }
+    }
+
+    function scanRoot(root = document) {
+        const wrappers = root.querySelectorAll ? root.querySelectorAll(imageWrapperSelector) : [];
+        wrappers.forEach(scanWrapper);
+    }
+
+    function scheduleScan(targetNode) {
+        if (scanTimer) {
+            clearTimeout(scanTimer);
+        }
+        scanTimer = setTimeout(() => {
+            scanTimer = null;
+            if (targetNode && targetNode.nodeType === Node.ELEMENT_NODE) {
+                const directWrapper = resolveWrapperElement(targetNode);
+                if (directWrapper) {
+                    scanWrapper(directWrapper);
+                }
+                scanRoot(targetNode);
+                return;
+            }
+            scanRoot(document);
+        }, SCAN_DEBOUNCE_MS);
+    }
+
+    const observer = new MutationObserver((mutationsList) => {
+        let shouldScan = false;
+        for (const mutation of mutationsList) {
+            if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        shouldScan = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (shouldScan) {
+            scanForImages();
+        }
+    });
+
+    function startObserver() {
+        ensureGlobalActions();
+        scanForImages();
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    function scanForImages() {
+        const potentialWrappers = document.querySelectorAll(imageParentSelectors.join(', '));
+        potentialWrappers.forEach((potentialWrapper) => {
+            console.log(potentialWrapper);
+            let elementForUrlExtraction =
+                potentialWrapper.querySelector('img[src*="discordapp.com"], img[src*="discordapp.net"]') ||
+                potentialWrapper.querySelector('a[href*="discordapp.com"], a[href*="discordapp.net"]') ||
+                potentialWrapper;
+
+            const currentDetectedUrlInDom = getImageUrl(elementForUrlExtraction);
+
+            if (currentDetectedUrlInDom) {
+                addButtonsToImageWrapper(potentialWrapper, currentDetectedUrlInDom);
+            }
+        });
+    }
+
+    const style = document.createElement('style');
+    style.innerHTML = `
+        .custom-image-buttons-container {
+          display: flex;
+          flex-direction: row;
+          gap: 8px;
+          background-color: #202225;
+          padding: 6px 8px;
+          border-radius: 5px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+          pointer-events: auto;
+          margin-top: 8px;
+          margin-bottom: 8px;
+          justify-self: center;
+        }
+
+        .custom-global-image-actions {
+          position: fixed;
+          right: 24px;
+          bottom: 24px;
+          z-index: 999999;
+          display: flex;
+          gap: 8px;
+          padding: 10px;
+          border-radius: 10px;
+          background: rgba(32, 34, 37, 0.92);
+          box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        }
+
+        .custom-global-image-status {
+          position: fixed;
+          right: 24px;
+          bottom: 88px;
+          z-index: 999999;
+          max-width: 360px;
+          padding: 10px 14px;
+          border-radius: 10px;
+          background: rgba(32, 34, 37, 0.96);
+          color: #fff;
+          font-size: 13px;
+          line-height: 1.45;
+          box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+          opacity: 0;
+          transform: translateY(8px);
+          pointer-events: none;
+          transition: opacity 0.18s ease, transform 0.18s ease;
+        }
+
+        .custom-global-image-status.is-visible {
+          opacity: 1;
+          transform: translateY(0);
+        }
+
+        .custom-global-image-status[data-status-type="success"] {
+          border-left: 4px solid #57f287;
+        }
+
+        .custom-global-image-status[data-status-type="error"] {
+          border-left: 4px solid #ed4245;
+        }
+
+        .custom-global-image-status[data-status-type="warning"] {
+          border-left: 4px solid #faa61a;
+        }
+
+        .custom-global-image-status[data-status-type="info"] {
+          border-left: 4px solid #5865f2;
+        }
+
+        .custom-global-download-link {
+          position: fixed;
+          right: 24px;
+          bottom: 148px;
+          z-index: 999999;
+          max-width: 360px;
+          padding: 10px 14px;
+          border-radius: 10px;
+          background: rgba(87, 242, 135, 0.96);
+          color: #202225;
+          font-size: 13px;
+          line-height: 1.45;
+          font-weight: 700;
+          text-decoration: none;
+          box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        }
+
+        .custom-global-download-link:hover {
+          background: rgba(61, 214, 113, 0.98);
+        }
+
+        .custom-global-copy-link-button {
+          position: fixed;
+          right: 24px;
+          bottom: 204px;
+          z-index: 999999;
+          max-width: 360px;
+          padding: 10px 14px;
+          border-radius: 10px;
+          background: rgba(88, 101, 242, 0.96);
+          color: #fff;
+          font-size: 13px;
+          line-height: 1.45;
+          font-weight: 700;
+          border: none;
+          cursor: pointer;
+          box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        }
+
+        .custom-global-copy-link-button:hover {
+          background: rgba(71, 82, 196, 0.98);
+        }
+
+        .custom-image-button {
+          color: #FFFFFF;
+          border: 1px solid rgba(0,0,0,0.2);
+          padding: 8px 12px;
+          border-radius: 4px;
+          cursor: pointer;
+          font-family: "gg sans", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+          font-size: 13px;
+          font-weight: 600;
+          transition: background-color 0.15s ease, color 0.15s ease, transform 0.1s ease, border-color 0.15s ease;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 90px;
+          box-sizing: border-box;
+          text-align: center;
+          line-height: 1.2;
+        }
+
+        .custom-image-button:disabled {
+          background-color: #9e9e9e;
+          cursor: not-allowed;
+          color: #b0b0b0;
+        }
+
+        .custom-image-button:hover:not(:disabled) {
+          transform: translateY(-1px);
+          box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .custom-image-button:active:not(:disabled) {
+          transform: translateY(0px);
+          box-shadow: inset 0 1px 2px rgba(0,0,0,0.1);
+        }
+
+        .custom-download-button {
+          background-color: #72b572;
+          border-color: #5f985f;
+        }
+
+        .custom-download-button:hover {
+          background-color: #65a565;
+          border-color: #508750;
+          color: #FFFFFF;
+        }
+
+        .custom-download-button:active {
+          background-color: #589558;
+        }
+
+        .custom-download-all-button {
+          background-color: #5865F2;
+          border-color: #4752c4;
+          min-width: 120px;
+        }
+
+        .custom-download-all-button:hover {
+          background-color: #4752c4;
+          border-color: #3c45a5;
+          color: #FFFFFF;
+        }
+
+        .custom-download-all-button:active {
+          background-color: #3c45a5;
+        }
+
+        .custom-download-zip-button {
+          background-color: #f0b232;
+          border-color: #d29a24;
+          min-width: 120px;
+          color: #202225;
+        }
+
+        .custom-download-zip-button:hover {
+          background-color: #d29a24;
+          border-color: #b8841e;
+          color: #202225;
+        }
+
+        .custom-download-zip-button:active {
+          background-color: #b8841e;
+        }
+    `;
+    document.head.appendChild(style);
+
+    startObserver();
+})();
