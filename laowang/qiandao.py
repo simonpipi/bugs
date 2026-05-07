@@ -423,7 +423,6 @@ def run() -> None:
     cookies = merge_response_cookies(cookies, submit_response)
     save_json(COOKIES_JSON_PATH, cookies)
     print(f"submit status: {submit_response.status_code}")
-    print(submit_response.text)
 
 
 if __name__ == "__main__":
