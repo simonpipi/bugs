@@ -3,6 +3,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -22,9 +23,14 @@ META_PATH = BASE_DIR / "captcha_char_cnn_meta.json"
 IMAGE_SIZE = 32
 BACKGROUND_CLASS = 10
 CLASS_NAMES = [str(index) for index in range(10)] + ["bg"]
-BACKGROUND_SCORE_WEIGHT = 2.0
+BACKGROUND_SCORE_WEIGHT = 1.6
 SLOT_SCAN_SOURCE_PENALTY = 0.10
+TEMPLATE_SCAN_SOURCE_PENALTY = 0.30
+TEMPLATE_MISMATCH_PENALTY = 0.05
+TEMPLATE_MATCH_BONUS = 0.10
 POSITION_FALLBACK_SOURCE_PENALTY = 0.08
+CLASSIFY_PADS = (1, 3, 5)
+GEOMETRY_DIGIT_WEIGHT = 0.6
 
 
 def import_torch():
@@ -114,6 +120,108 @@ def compute_slot_windows(rows, image_width=150, image_height=60):
         y1 = image_height
         windows[str(position)] = {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
     return windows
+
+
+def compute_position_center_ranges(rows):
+    ranges = {}
+    for position in range(4):
+        centers = [
+            int(row["x"]) + int(row["w"]) / 2
+            for row in rows
+            if int(row["pos"]) == position
+        ]
+        ranges[str(position)] = {
+            "min": min(centers),
+            "max": max(centers),
+            "median": float(np.median(centers)),
+        }
+    return ranges
+
+
+def compute_slot_scan_templates(rows):
+    templates = {}
+    for position in range(4):
+        position_templates = []
+        seen = set()
+        for digit in range(10):
+            items = [
+                row
+                for row in rows
+                if int(row["pos"]) == position and int(row["digit"]) == digit
+            ]
+            if len(items) < 3:
+                continue
+            widths = [int(row["w"]) for row in items]
+            heights = [int(row["h"]) for row in items]
+            ys = [int(row["y"]) for row in items]
+            centers = [int(row["x"]) + int(row["w"]) / 2 for row in items]
+            width = int(round(float(np.median(widths))))
+            height = int(round(float(np.median(heights))))
+            center_x = float(np.median(centers))
+            x = int(round(center_x - width / 2))
+            y = int(round(float(np.median(ys))))
+            box = (
+                max(0, min(150 - width, x)),
+                max(0, min(60 - height, y)),
+                width,
+                height,
+            )
+            if box in seen:
+                continue
+            seen.add(box)
+            position_templates.append(
+                {
+                    "box": box,
+                    "digit_template": str(digit),
+                }
+            )
+        templates[str(position)] = position_templates
+    return templates
+
+
+def compute_slot_scan_templates_v2(rows):
+    templates = {}
+    for position in range(4):
+        position_templates = []
+        seen = set()
+        for digit in range(10):
+            items = [
+                row
+                for row in rows
+                if int(row["pos"]) == position and int(row["digit"]) == digit
+            ]
+            if not items:
+                continue
+            indexes = {0, len(items) // 2, len(items) - 1}
+            if len(items) >= 6:
+                indexes.update({len(items) // 4, len(items) * 3 // 4})
+            for index in sorted(indexes):
+                item = sorted(items, key=lambda row: (int(row["y"]), int(row["x"])))[index]
+                box = box_tuple(item)
+                if box in seen:
+                    continue
+                seen.add(box)
+                position_templates.append(
+                    {
+                        "box": box,
+                        "digit_template": str(digit),
+                    }
+                )
+        templates[str(position)] = position_templates
+    return templates
+
+
+def compute_digit_box_stats(rows):
+    stats = {}
+    for digit in range(10):
+        items = [row for row in rows if int(row["digit"]) == digit]
+        if not items:
+            continue
+        stats[str(digit)] = {
+            "w": float(np.median([int(row["w"]) for row in items])),
+            "h": float(np.median([int(row["h"]) for row in items])),
+        }
+    return stats
 
 
 def box_tuple(row):
@@ -344,6 +452,10 @@ def train_char_cnn(
         "hard_negative_samples": len(hard_negative_samples),
         "position_boxes": compute_position_boxes(rows),
         "slot_windows": compute_slot_windows(rows),
+        "position_center_ranges": compute_position_center_ranges(rows),
+        "slot_scan_templates": compute_slot_scan_templates(rows),
+        "slot_scan_templates_v2": compute_slot_scan_templates_v2(rows),
+        "digit_box_stats": compute_digit_box_stats(rows),
         "val_accuracy": best_accuracy,
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -372,6 +484,20 @@ def load_char_cnn(model_path=MODEL_PATH, meta_path=META_PATH):
     if not model_path.exists() or not meta_path.exists():
         raise RuntimeError(f"缺少 CNN 模型，请先执行：python3 southplus/train_char_cnn.py")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if CHAR_LABELS_CSV.exists():
+        rows = None
+        if "position_center_ranges" not in meta:
+            rows = rows or read_csv(CHAR_LABELS_CSV)
+            meta["position_center_ranges"] = compute_position_center_ranges(rows)
+        if "slot_scan_templates" not in meta:
+            rows = rows or read_csv(CHAR_LABELS_CSV)
+            meta["slot_scan_templates"] = compute_slot_scan_templates(rows)
+        if "slot_scan_templates_v2" not in meta:
+            rows = rows or read_csv(CHAR_LABELS_CSV)
+            meta["slot_scan_templates_v2"] = compute_slot_scan_templates_v2(rows)
+        if "digit_box_stats" not in meta:
+            rows = rows or read_csv(CHAR_LABELS_CSV)
+            meta["digit_box_stats"] = compute_digit_box_stats(rows)
     model = SlotCharCNN(num_classes=len(meta.get("classes", CLASS_NAMES)))
     model.load_state_dict(torch.load(model_path, map_location="cpu"))
     model.eval()
@@ -410,6 +536,7 @@ def component_candidates(image):
 def slot_candidates_for_position(components, meta, position):
     slot = meta["slot_windows"][str(position)]
     position_box = meta["position_boxes"][str(position)]
+    center_range = meta.get("position_center_ranges", {}).get(str(position))
     center = position_box["x"] + position_box["w"] / 2
     slot_x0 = slot["x"]
     slot_x1 = slot["x"] + slot["w"]
@@ -417,7 +544,10 @@ def slot_candidates_for_position(components, meta, position):
     for item in components:
         x, y, width, height = item["box"]
         item_center = x + width / 2
-        if not (slot_x0 - 8 <= item_center <= slot_x1 + 8):
+        if center_range:
+            if not (center_range["min"] - 4 <= item_center <= center_range["max"] + 4):
+                continue
+        elif not (slot_x0 - 8 <= item_center <= slot_x1 + 8):
             continue
         distance = abs(item_center - center)
         candidates.append({**item, "distance": distance})
@@ -445,18 +575,87 @@ def slot_candidates_for_position(components, meta, position):
                 "distance": 0,
             }
         )
+    templates = meta.get("slot_scan_templates_v2") or meta.get("slot_scan_templates", {})
+    for template in templates.get(str(position), []):
+        candidates.append(
+            {
+                "box": tuple(template["box"]),
+                "source": "template_scan",
+                "score": 0,
+                "distance": 0,
+                "digit_template": template.get("digit_template", ""),
+            }
+        )
     return candidates
 
 
 def classify_crop(model, image, box):
     torch, _, _, _ = import_torch()
-    crop = crop_box(image, box, pad=3)
-    tensor = tensor_from_image(torch, make_square(crop)).unsqueeze(0)
+    tensors = [
+        tensor_from_image(torch, make_square(crop_box(image, box, pad=pad)))
+        for pad in CLASSIFY_PADS
+    ]
+    tensor = torch.stack(tensors)
     with torch.no_grad():
-        probabilities = torch.softmax(model(tensor), dim=1)[0]
+        probabilities = torch.softmax(model(tensor), dim=1).mean(dim=0)
     values = [float(probabilities[index].item()) for index in range(len(CLASS_NAMES))]
     digit_index = max(range(10), key=lambda index: values[index])
     return str(digit_index), values[digit_index], values[BACKGROUND_CLASS], values
+
+
+def classify_crops(model, image, boxes):
+    torch, _, _, _ = import_torch()
+    boxes = list(dict.fromkeys(tuple(box) for box in boxes))
+    if not boxes:
+        return {}
+
+    tensors = []
+    owners = []
+    for box_index, box in enumerate(boxes):
+        for pad in CLASSIFY_PADS:
+            tensors.append(tensor_from_image(torch, make_square(crop_box(image, box, pad=pad))))
+            owners.append(box_index)
+
+    batch = torch.stack(tensors)
+    with torch.no_grad():
+        batch_probabilities = torch.softmax(model(batch), dim=1)
+
+    probability_sums = [torch.zeros_like(batch_probabilities[0]) for _ in boxes]
+    counts = [0 for _ in boxes]
+    for probabilities, box_index in zip(batch_probabilities, owners):
+        probability_sums[box_index] += probabilities
+        counts[box_index] += 1
+
+    results = {}
+    for box, probability_sum, count in zip(boxes, probability_sums, counts):
+        probabilities = probability_sum / count
+        values = [float(probabilities[index].item()) for index in range(len(CLASS_NAMES))]
+        digit_index = max(range(10), key=lambda index: values[index])
+        results[box] = (str(digit_index), values[digit_index], values[BACKGROUND_CLASS], values)
+    return results
+
+
+def choose_digit_with_geometry(probabilities, box, meta):
+    stats = meta.get("digit_box_stats") or {}
+    if not stats or GEOMETRY_DIGIT_WEIGHT <= 0:
+        digit_index = max(range(10), key=lambda index: probabilities[index])
+        return str(digit_index), probabilities[digit_index]
+
+    _, _, width, height = box
+    best = None
+    for digit in range(10):
+        digit_stats = stats.get(str(digit))
+        if not digit_stats:
+            continue
+        shape_distance = abs(math.log(max(1, width) / digit_stats["w"])) + abs(math.log(max(1, height) / digit_stats["h"]))
+        score = math.log(max(probabilities[digit], 1e-8)) - GEOMETRY_DIGIT_WEIGHT * shape_distance
+        if best is None or score > best[0]:
+            best = (score, digit)
+    if best is None:
+        digit_index = max(range(10), key=lambda index: probabilities[index])
+    else:
+        digit_index = best[1]
+    return str(digit_index), probabilities[digit_index]
 
 
 def box_center_x(box):
@@ -470,21 +669,28 @@ def candidates_conflict(left, right):
     return box_iou(left["box"], right["box"]) > 0.55
 
 
-def score_slot_candidates(model, image, components, meta, position, classification_cache):
+def score_slot_candidates(candidates, classification_cache, position, meta):
     items = []
-    for candidate in slot_candidates_for_position(components, meta, position):
+    for candidate in candidates:
         key = tuple(candidate["box"])
-        if key not in classification_cache:
-            classification_cache[key] = classify_crop(model, image, candidate["box"])
-        digit, digit_prob, background_prob, probabilities = classification_cache[key]
+        _, _, background_prob, probabilities = classification_cache[key]
+        digit, digit_prob = choose_digit_with_geometry(probabilities, key, meta)
 
         distance_penalty = min(candidate.get("distance", 0), 40) / 40 * 0.25
         if candidate["source"] == "position_fallback":
             source_penalty = POSITION_FALLBACK_SOURCE_PENALTY
+        elif candidate["source"] == "template_scan":
+            source_penalty = TEMPLATE_SCAN_SOURCE_PENALTY
         elif candidate["source"] == "slot_scan":
             source_penalty = SLOT_SCAN_SOURCE_PENALTY
         else:
             source_penalty = 0.0
+        if candidate["source"] == "template_scan":
+            digit_template = str(candidate.get("digit_template", ""))
+            if digit_template and digit_template == digit:
+                source_penalty -= TEMPLATE_MATCH_BONUS
+            elif digit_template:
+                source_penalty += TEMPLATE_MISMATCH_PENALTY
         score = digit_prob - BACKGROUND_SCORE_WEIGHT * background_prob - distance_penalty - source_penalty
         items.append(
             {
@@ -501,7 +707,7 @@ def score_slot_candidates(model, image, components, meta, position, classificati
     return sorted(items, key=lambda item: item["score"], reverse=True)
 
 
-def select_best_sequence(candidates_by_position, max_per_position=18):
+def select_best_sequence(candidates_by_position, max_per_position=10):
     best = None
     ranked = [items[:max_per_position] for items in candidates_by_position]
 
@@ -538,9 +744,16 @@ def recognize_image_with_cnn(image_path, model=None, meta=None, model_path=MODEL
         raise RuntimeError(f"图片读取失败: {image_path}")
 
     components = component_candidates(image)
-    classification_cache = {}
+    raw_candidates_by_position = [slot_candidates_for_position(components, meta, position) for position in range(4)]
+    boxes = [
+        tuple(candidate["box"])
+        for candidates in raw_candidates_by_position
+        for candidate in candidates
+    ]
+    classification_cache = classify_crops(model, image, boxes)
     candidates_by_position = [
-        score_slot_candidates(model, image, components, meta, position, classification_cache) for position in range(4)
+        score_slot_candidates(candidates, classification_cache, position, meta)
+        for position, candidates in enumerate(raw_candidates_by_position)
     ]
     debug = select_best_sequence(candidates_by_position)
     chars = [item["digit"] for item in debug]
