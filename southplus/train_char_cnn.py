@@ -2,7 +2,16 @@
 import argparse
 from pathlib import Path
 
-from cnn_captcha import HARD_NEGATIVES_CSV, CHAR_LABELS_CSV, META_PATH, MODEL_PATH, SAMPLES_DIR, read_csv, train_char_cnn
+from cnn_captcha import (
+    CHAR_LABELS_CSV,
+    HARD_NEGATIVES_CSV,
+    HARD_POSITIVES_CSV,
+    META_PATH,
+    MODEL_PATH,
+    SAMPLES_DIR,
+    read_csv,
+    train_char_cnn,
+)
 
 
 def parse_args():
@@ -16,6 +25,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--negative-per-file", type=int, default=8)
     parser.add_argument("--hard-negatives", default=str(HARD_NEGATIVES_CSV))
+    parser.add_argument("--hard-positives", default=str(HARD_POSITIVES_CSV))
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -37,10 +47,12 @@ def main():
         learning_rate=args.lr,
         negative_per_file=args.negative_per_file,
         hard_negatives_path=Path(args.hard_negatives).expanduser().resolve(),
+        hard_positives_path=Path(args.hard_positives).expanduser().resolve(),
         val_ratio=args.val_ratio,
         seed=args.seed,
     )
     print(f"训练字符样本: {meta['samples']}")
+    print(f"Hard positive: {meta['hard_positive_samples']}")
     print(f"背景负样本: {meta['negative_samples']}")
     print(f"Hard negative: {meta['hard_negative_samples']}")
     print(f"验证集字符准确率: {meta['val_accuracy']:.2%}")

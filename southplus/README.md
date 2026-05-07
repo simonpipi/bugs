@@ -62,22 +62,31 @@ python3 southplus/evaluate_candidate_recall.py
 python3 southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results.csv
 ```
 
+导出同框误分类 hard positives 和 crop：
+
+```bash
+python3 southplus/analyze_cnn_mismatches.py \
+  --results /tmp/cnn_results.csv \
+  --hard-positives-output southplus/captcha_samples/hard_positives.csv \
+  --export-same-box-crops southplus/captcha_samples/same_box_crops
+```
+
 ## 当前最终效果
 
 在 200 张已标注样本上，当前版本验证结果：
 
 ```text
-sequence: 137/200 = 68.50%
-character: 729/800 = 91.12%
+sequence: 142/200 = 71.00%
+character: 735/800 = 91.88%
 ```
 
 候选框诊断结果：
 
 ```text
-raw_candidate_recall@0.45: 755/800 = 94.38%
+raw_candidate_recall@0.45: 760/800 = 95.00%
 ranked_recall@1:        672/800 = 84.00%
-ranked_recall@3:        726/800 = 90.75%
-ranked_recall@10:       737/800 = 92.12%
+ranked_recall@3:        719/800 = 89.88%
+ranked_recall@10:       741/800 = 92.62%
 ```
 
 ## 优化版本记录
@@ -155,13 +164,49 @@ v2.1:    sequence 137/200, character 729/800
 
 这个收益不大，但没有观察到回退样本，因此保留。
 
+### V2.2：局部模板搜索和 hard positive 导出
+
+核心改动：
+
+- `template_scan` 候选会额外尝试基于局部前景的 `template_local` 精修框，补齐轻微偏移的模板命中。
+- 对 `template_local` 做尺寸收紧，避免局部前景合并成大框后抢分。
+- 对 `1` 类加入温和窄框先验，压低过小噪点和过大模板框，但保留真实 `1` 的宽高波动。
+- `evaluate_candidate_recall.py` 改为按图片缓存候选和 CNN 分类结果，避免每个字符槽位重复识别同一张图片。
+- `analyze_cnn_mismatches.py` 支持导出 `same_box_classification` 为 hard positive CSV 和 crop 图片。
+- `train_char_cnn.py` 支持 `--hard-positives`，可把导出的同框错例作为正样本补充训练。
+
+对比 v2.1：
+
+```text
+sequence:  137/200 -> 140/200
+character: 729/800 -> 732/800
+raw_candidate_recall@0.45: 755/800 -> 760/800
+```
+
+### V2.3：局部模板候选降惩罚
+
+核心改动：
+
+- 将 `TEMPLATE_LOCAL_SOURCE_PENALTY` 从 `0.32` 调整为 `0.0`。
+- 离线对比 `template_local` 惩罚、模板惩罚、模板匹配奖励、背景惩罚和裁剪 pad 组合后，只有局部模板降惩罚有稳定收益。
+- 通用数字形状惩罚和替换 `CLASSIFY_PADS=(1,3,5)` 均未带来收益，因此不保留。
+- 直接把 29 个 hard positives 并入默认训练会明显回退，模型文件未替换。
+
+对比 v2.2：
+
+```text
+sequence:  140/200 -> 142/200
+character: 732/800 -> 735/800
+wrong_slots: 68 -> 65
+```
+
 ## 当前识别流程
 
 1. 读取图片。
 2. 用 `component_candidates` 生成连通域候选。
 3. 用槽位中心范围过滤跨槽候选。
 4. 加入 `position_fallback` 和若干 `slot_scan` 扫描框。
-5. 加入 `slot_scan_templates_v2` 模板候选。
+5. 加入 `slot_scan_templates_v2` 模板候选和局部前景精修候选。
 6. 用 CNN 对所有候选框批量分类。
 7. 对每个候选按以下因素打分：
    - 数字概率
@@ -170,6 +215,7 @@ v2.1:    sequence 137/200, character 729/800
    - 来源优先级惩罚
    - 模板数字匹配加分或不匹配惩罚
    - 数字框宽高几何先验
+   - `1` 类窄框先验
 8. 四个槽位联合搜索，要求位置单调且候选框不严重冲突。
 
 ## 训练流程
@@ -202,28 +248,43 @@ python3 southplus/mine_hard_negatives.py
 python3 southplus/train_char_cnn.py --hard-negatives southplus/captcha_samples/hard_negatives.csv
 ```
 
+如需加入同框误分类 hard positives：
+
+```bash
+python3 southplus/analyze_cnn_mismatches.py \
+  --results /tmp/cnn_results.csv \
+  --hard-positives-output southplus/captcha_samples/hard_positives.csv \
+  --export-same-box-crops southplus/captcha_samples/same_box_crops
+python3 southplus/train_char_cnn.py \
+  --hard-positives southplus/captcha_samples/hard_positives.csv \
+  --model /tmp/captcha_char_cnn_hp.pt \
+  --meta /tmp/captcha_char_cnn_hp_meta.json
+```
+
+注意：hard positives 直接并入默认训练未必提升整题识别。当前验证中临时模型为 `sequence 97/200`、`character 677/800`，因此没有替换现有模型；后续需要先调采样权重或训练策略，再用 `/tmp` 模型评估通过后再覆盖正式模型。
+
 ## 错例分析
 
 当前最终版剩余错位：
 
 ```text
-wrong_slots: 71
-fallback_or_scan_miss: 38
-same_box_classification: 26
+wrong_slots: 65
+fallback_or_scan_miss: 29
+same_box_classification: 28
 tiny_noise_component: 5
-wrong_component_box: 2
+wrong_component_box: 3
 ```
 
 高频混淆：
 
 ```text
 3 -> 9: 10
-5 -> 0: 8
+5 -> 0: 7
 5 -> 1: 6
-1 -> 9: 6
 0 -> 9: 5
-5 -> 9: 5
+1 -> 9: 5
 7 -> 9: 5
+5 -> 9: 4
 ```
 
 这说明候选框问题已经明显减少，下一步收益主要来自两类方向：
@@ -233,8 +294,7 @@ wrong_component_box: 2
 
 ## 建议的下一步优化
 
-1. 导出最终错例中的 `same_box_classification` crop，补充到训练集或单独做 hard example 微调。
-2. 对 `template_scan` 增加更细的局部搜索，而不是直接复用标注代表框。
-3. 对 `1` 类加入更强的窄框先验，避免被大模板或背景小竖线干扰。
-4. 把 `evaluate_candidate_recall.py` 作为每次候选改动后的第一道验证，先确认候选召回和排名，再跑整题评估。
-
+1. 调整 hard positive 采样权重或单独做小学习率微调，再比较重训前后的 `same_box_classification` 变化。
+2. 继续压制 `template_scan` 大框，重点看 `3->9`、`7->9` 和低位 `0/5`。
+3. 针对 `5->0`、`5->1` 增加更细的数字级后验校正。
+4. 保持 `evaluate_candidate_recall.py` 作为每次候选改动后的第一道验证，先确认候选召回和排名，再跑整题评估。

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import cv2
@@ -47,70 +47,87 @@ def main():
     miss_examples = []
     rank_examples = []
 
+    rows_by_file = defaultdict(list)
     for row in read_csv(Path(args.char_labels).expanduser().resolve()):
-        file_name = row["file"]
-        position = int(row["pos"])
-        expected_box = box_tuple(row)
+        rows_by_file[row["file"]].append(row)
+
+    for file_name, file_rows in sorted(rows_by_file.items()):
         image = cv2.imread(str(samples_dir / file_name))
         if image is None:
             continue
 
         components = component_candidates(image)
-        raw_candidates = slot_candidates_for_position(components, meta, position)
-        boxes = [tuple(candidate["box"]) for candidate in raw_candidates]
-        cache = classify_crops(model, image, boxes)
-        scored = score_slot_candidates(raw_candidates, cache, position, meta)
-        total += 1
-
-        raw_hits = [
-            candidate
-            for candidate in raw_candidates
-            if box_iou(candidate["box"], expected_box) >= args.iou
+        raw_by_position = [
+            slot_candidates_for_position(components, meta, position, image=image)
+            for position in range(4)
         ]
-        if raw_hits:
-            raw_recall += 1
-            best = max(raw_hits, key=lambda candidate: box_iou(candidate["box"], expected_box))
-            best_source[best["source"]] += 1
-        elif len(miss_examples) < 12:
-            nearest = max(raw_candidates, key=lambda candidate: box_iou(candidate["box"], expected_box))
-            miss_examples.append(
-                {
-                    "file": file_name,
-                    "pos": position,
-                    "digit": row["digit"],
-                    "expected": expected_box,
-                    "nearest_iou": round(box_iou(nearest["box"], expected_box), 2),
-                    "nearest_source": nearest["source"],
-                    "nearest_box": nearest["box"],
-                }
-            )
+        boxes = [
+            tuple(candidate["box"])
+            for raw_candidates in raw_by_position
+            for candidate in raw_candidates
+        ]
+        cache = classify_crops(model, image, boxes)
+        scored_by_position = [
+            score_slot_candidates(raw_candidates, cache, position, meta)
+            for position, raw_candidates in enumerate(raw_by_position)
+        ]
 
-        hit_rank = None
-        for index, candidate in enumerate(scored, 1):
-            if box_iou(candidate["box"], expected_box) >= args.iou:
-                hit_rank = index
-                chosen_source[candidate["source"]] += 1
-                break
-        if hit_rank is not None:
-            for limit in [1, 3, 5, 10]:
-                if hit_rank <= limit:
-                    ranked_recall[limit] += 1
-            if hit_rank > 3 and len(rank_examples) < 12:
-                rank_examples.append(
+        for row in file_rows:
+            position = int(row["pos"])
+            expected_box = box_tuple(row)
+            raw_candidates = raw_by_position[position]
+            scored = scored_by_position[position]
+            total += 1
+
+            raw_hits = [
+                candidate
+                for candidate in raw_candidates
+                if box_iou(candidate["box"], expected_box) >= args.iou
+            ]
+            if raw_hits:
+                raw_recall += 1
+                best = max(raw_hits, key=lambda candidate: box_iou(candidate["box"], expected_box))
+                best_source[best["source"]] += 1
+            elif len(miss_examples) < 12:
+                nearest = max(raw_candidates, key=lambda candidate: box_iou(candidate["box"], expected_box))
+                miss_examples.append(
                     {
                         "file": file_name,
                         "pos": position,
                         "digit": row["digit"],
-                        "rank": hit_rank,
-                        "top": {
-                            "digit": scored[0]["digit"],
-                            "source": scored[0]["source"],
-                            "score": round(scored[0]["score"], 3),
-                            "box": scored[0]["box"],
-                            "iou": round(box_iou(scored[0]["box"], expected_box), 2),
-                        },
+                        "expected": expected_box,
+                        "nearest_iou": round(box_iou(nearest["box"], expected_box), 2),
+                        "nearest_source": nearest["source"],
+                        "nearest_box": nearest["box"],
                     }
                 )
+
+            hit_rank = None
+            for index, candidate in enumerate(scored, 1):
+                if box_iou(candidate["box"], expected_box) >= args.iou:
+                    hit_rank = index
+                    chosen_source[candidate["source"]] += 1
+                    break
+            if hit_rank is not None:
+                for limit in [1, 3, 5, 10]:
+                    if hit_rank <= limit:
+                        ranked_recall[limit] += 1
+                if hit_rank > 3 and len(rank_examples) < 12:
+                    rank_examples.append(
+                        {
+                            "file": file_name,
+                            "pos": position,
+                            "digit": row["digit"],
+                            "rank": hit_rank,
+                            "top": {
+                                "digit": scored[0]["digit"],
+                                "source": scored[0]["source"],
+                                "score": round(scored[0]["score"], 3),
+                                "box": scored[0]["box"],
+                                "iou": round(box_iou(scored[0]["box"], expected_box), 2),
+                            },
+                        }
+                    )
 
     print(f"slots: {total}")
     print(f"raw_candidate_recall@{args.iou}: {raw_recall}/{total} = {raw_recall / total:.2%}")

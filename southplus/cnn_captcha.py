@@ -17,6 +17,7 @@ SAMPLES_DIR = BASE_DIR / "captcha_samples"
 CHAR_LABELS_CSV = SAMPLES_DIR / "char_labels.csv"
 LABELS_CSV = SAMPLES_DIR / "labels.csv"
 HARD_NEGATIVES_CSV = SAMPLES_DIR / "hard_negatives.csv"
+HARD_POSITIVES_CSV = SAMPLES_DIR / "hard_positives.csv"
 MODEL_PATH = BASE_DIR / "captcha_char_cnn.pt"
 META_PATH = BASE_DIR / "captcha_char_cnn_meta.json"
 
@@ -26,11 +27,19 @@ CLASS_NAMES = [str(index) for index in range(10)] + ["bg"]
 BACKGROUND_SCORE_WEIGHT = 1.6
 SLOT_SCAN_SOURCE_PENALTY = 0.10
 TEMPLATE_SCAN_SOURCE_PENALTY = 0.30
+TEMPLATE_LOCAL_SOURCE_PENALTY = 0.0
 TEMPLATE_MISMATCH_PENALTY = 0.05
 TEMPLATE_MATCH_BONUS = 0.10
 POSITION_FALLBACK_SOURCE_PENALTY = 0.08
+TEMPLATE_LOCAL_MIN_WIDTH_RATIO = 0.45
+TEMPLATE_LOCAL_MIN_HEIGHT_RATIO = 0.45
+TEMPLATE_LOCAL_MIN_AREA_RATIO = 0.25
 CLASSIFY_PADS = (1, 3, 5)
 GEOMETRY_DIGIT_WEIGHT = 0.6
+ONE_MIN_WIDTH = 6
+ONE_MIN_HEIGHT = 8
+ONE_MAX_WIDTH = 22
+ONE_MAX_HEIGHT = 28
 
 
 def import_torch():
@@ -246,6 +255,81 @@ def crop_box(image, box, pad=3):
     return image[y0:y1, x0:x1]
 
 
+def clamp_box(box, image_width=150, image_height=60):
+    x, y, width, height = [int(round(value)) for value in box]
+    width = max(1, min(image_width, width))
+    height = max(1, min(image_height, height))
+    x = max(0, min(image_width - width, x))
+    y = max(0, min(image_height - height, y))
+    return (x, y, width, height)
+
+
+def local_foreground_template_box(image, box, pad=6):
+    image_height, image_width = image.shape[:2]
+    x, y, width, height = [int(value) for value in box]
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(image_width, x + width + pad)
+    y1 = min(image_height, y + height + pad)
+    roi = image[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    saturated = cv2.inRange(hsv, np.array([0, 45, 0]), np.array([179, 255, 255]))
+    dark = cv2.inRange(gray, 0, 170)
+    mask = cv2.bitwise_or(saturated, dark)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    kept = []
+    base_center_x = x - x0 + width / 2
+    base_center_y = y - y0 + height / 2
+    for index in range(1, count):
+        cx, cy = centroids[index]
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        component_w = int(stats[index, cv2.CC_STAT_WIDTH])
+        component_h = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if area < 8 or component_w > width + pad * 2 or component_h > height + pad * 2:
+            continue
+        if abs(cx - base_center_x) > max(8, width * 0.7):
+            continue
+        if abs(cy - base_center_y) > max(8, height * 0.7):
+            continue
+        kept.append(index)
+    if not kept:
+        return None
+
+    xs = [int(stats[index, cv2.CC_STAT_LEFT]) for index in kept]
+    ys = [int(stats[index, cv2.CC_STAT_TOP]) for index in kept]
+    rights = [int(stats[index, cv2.CC_STAT_LEFT] + stats[index, cv2.CC_STAT_WIDTH]) for index in kept]
+    bottoms = [int(stats[index, cv2.CC_STAT_TOP] + stats[index, cv2.CC_STAT_HEIGHT]) for index in kept]
+    refined = clamp_box(
+        (
+            x0 + min(xs),
+            y0 + min(ys),
+            max(rights) - min(xs),
+            max(bottoms) - min(ys),
+        ),
+        image_width=image_width,
+        image_height=image_height,
+    )
+    _, _, refined_w, refined_h = refined
+    if not (4 <= refined_w <= 48 and 7 <= refined_h <= 52):
+        return None
+    if (
+        refined_w < width * TEMPLATE_LOCAL_MIN_WIDTH_RATIO
+        or refined_h < height * TEMPLATE_LOCAL_MIN_HEIGHT_RATIO
+        or refined_w * refined_h < width * height * TEMPLATE_LOCAL_MIN_AREA_RATIO
+    ):
+        return None
+    if refined_w > width + 4 or refined_h > height + 4:
+        return None
+    return refined
+
+
 def make_square(crop, size=IMAGE_SIZE):
     if crop.size == 0:
         return np.full((size, size), 255, np.uint8)
@@ -326,12 +410,58 @@ def read_hard_negative_samples(path, rows=None):
     return samples
 
 
-def training_samples(rows, samples_dir, negative_per_file=8, seed=42, hard_negatives_path=HARD_NEGATIVES_CSV):
+def read_hard_positive_samples(path, rows=None):
+    path = Path(path)
+    if not path.exists():
+        return []
+
+    positives_by_file = {}
+    if rows is not None:
+        positives_by_file = char_rows_by_file(rows)
+
+    samples = []
+    seen = set()
+    for row in read_csv(path):
+        file_name = row.get("file", "")
+        digit = row.get("digit") or row.get("true_digit")
+        if not file_name or digit not in set(CLASS_NAMES[:10]):
+            continue
+        try:
+            box = tuple(int(row[key]) for key in ["x", "y", "w", "h"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if box[2] <= 0 or box[3] <= 0:
+            continue
+        if positives_by_file:
+            same_digit_boxes = [
+                box_tuple(item)
+                for item in positives_by_file.get(file_name, [])
+                if item.get("digit") == digit
+            ]
+            if not same_digit_boxes or all(box_iou(box, positive) < 0.30 for positive in same_digit_boxes):
+                continue
+        key = (file_name, *box, digit)
+        if key in seen:
+            continue
+        seen.add(key)
+        samples.append({"file": file_name, "box": box, "label": int(digit), "hard_positive": True})
+    return samples
+
+
+def training_samples(
+    rows,
+    samples_dir,
+    negative_per_file=8,
+    seed=42,
+    hard_negatives_path=HARD_NEGATIVES_CSV,
+    hard_positives_path=HARD_POSITIVES_CSV,
+):
     samples = []
     for row in rows:
         samples.append({"file": row["file"], "box": box_tuple(row), "label": int(row["digit"])})
     samples.extend(generate_negative_samples(rows, samples_dir, per_file=negative_per_file, seed=seed))
     samples.extend(read_hard_negative_samples(hard_negatives_path, rows=rows))
+    samples.extend(read_hard_positive_samples(hard_positives_path, rows=rows))
     return samples
 
 
@@ -391,18 +521,21 @@ def train_char_cnn(
     learning_rate=1e-3,
     negative_per_file=8,
     hard_negatives_path=HARD_NEGATIVES_CSV,
+    hard_positives_path=HARD_POSITIVES_CSV,
     val_ratio=0.15,
     seed=42,
 ):
     torch, nn, DataLoader, _ = import_torch()
     torch.manual_seed(seed)
     hard_negative_samples = read_hard_negative_samples(hard_negatives_path, rows=rows)
+    hard_positive_samples = read_hard_positive_samples(hard_positives_path, rows=rows)
     all_samples = training_samples(
         rows,
         Path(samples_dir),
         negative_per_file=negative_per_file,
         seed=seed,
         hard_negatives_path=hard_negatives_path,
+        hard_positives_path=hard_positives_path,
     )
     train_samples, val_samples = split_samples_by_file(all_samples, val_ratio=val_ratio, seed=seed)
     CharDataset = build_dataset_class()
@@ -441,13 +574,15 @@ def train_char_cnn(
     model_path = Path(model_path)
     meta_path = Path(meta_path)
     torch.save(model.state_dict(), model_path)
+    positive_samples = len(rows) + len(hard_positive_samples)
     meta = {
         "model": "slot_char_cnn_v1",
         "image_size": IMAGE_SIZE,
         "classes": CLASS_NAMES,
         "background_class": BACKGROUND_CLASS,
         "samples": len(rows),
-        "negative_samples": len(all_samples) - len(rows),
+        "hard_positive_samples": len(hard_positive_samples),
+        "negative_samples": len(all_samples) - positive_samples,
         "random_negative_samples": len(generate_negative_samples(rows, Path(samples_dir), per_file=negative_per_file, seed=seed)),
         "hard_negative_samples": len(hard_negative_samples),
         "position_boxes": compute_position_boxes(rows),
@@ -533,7 +668,7 @@ def component_candidates(image):
     return selected
 
 
-def slot_candidates_for_position(components, meta, position):
+def slot_candidates_for_position(components, meta, position, image=None):
     slot = meta["slot_windows"][str(position)]
     position_box = meta["position_boxes"][str(position)]
     center_range = meta.get("position_center_ranges", {}).get(str(position))
@@ -577,15 +712,29 @@ def slot_candidates_for_position(components, meta, position):
         )
     templates = meta.get("slot_scan_templates_v2") or meta.get("slot_scan_templates", {})
     for template in templates.get(str(position), []):
+        box = tuple(template["box"])
         candidates.append(
             {
-                "box": tuple(template["box"]),
+                "box": box,
                 "source": "template_scan",
                 "score": 0,
                 "distance": 0,
                 "digit_template": template.get("digit_template", ""),
             }
         )
+        if image is not None:
+            refined_box = local_foreground_template_box(image, box)
+            if refined_box and refined_box != box:
+                refined_center = refined_box[0] + refined_box[2] / 2
+                candidates.append(
+                    {
+                        "box": refined_box,
+                        "source": "template_local",
+                        "score": 0,
+                        "distance": abs(refined_center - center),
+                        "digit_template": template.get("digit_template", ""),
+                    }
+                )
     return candidates
 
 
@@ -669,6 +818,20 @@ def candidates_conflict(left, right):
     return box_iou(left["box"], right["box"]) > 0.55
 
 
+def digit_one_shape_penalty(box):
+    _, _, width, height = box
+    penalty = 0.0
+    if width < ONE_MIN_WIDTH:
+        penalty += (ONE_MIN_WIDTH - width) * 0.10
+    if height < ONE_MIN_HEIGHT:
+        penalty += (ONE_MIN_HEIGHT - height) * 0.06
+    if width > ONE_MAX_WIDTH:
+        penalty += min(0.45, (width - ONE_MAX_WIDTH) * 0.04)
+    if height > ONE_MAX_HEIGHT:
+        penalty += min(0.35, (height - ONE_MAX_HEIGHT) * 0.03)
+    return penalty
+
+
 def score_slot_candidates(candidates, classification_cache, position, meta):
     items = []
     for candidate in candidates:
@@ -681,16 +844,20 @@ def score_slot_candidates(candidates, classification_cache, position, meta):
             source_penalty = POSITION_FALLBACK_SOURCE_PENALTY
         elif candidate["source"] == "template_scan":
             source_penalty = TEMPLATE_SCAN_SOURCE_PENALTY
+        elif candidate["source"] == "template_local":
+            source_penalty = TEMPLATE_LOCAL_SOURCE_PENALTY
         elif candidate["source"] == "slot_scan":
             source_penalty = SLOT_SCAN_SOURCE_PENALTY
         else:
             source_penalty = 0.0
-        if candidate["source"] == "template_scan":
+        if candidate["source"] in {"template_scan", "template_local"}:
             digit_template = str(candidate.get("digit_template", ""))
             if digit_template and digit_template == digit:
                 source_penalty -= TEMPLATE_MATCH_BONUS
             elif digit_template:
                 source_penalty += TEMPLATE_MISMATCH_PENALTY
+        if digit == "1":
+            source_penalty += digit_one_shape_penalty(key)
         score = digit_prob - BACKGROUND_SCORE_WEIGHT * background_prob - distance_penalty - source_penalty
         items.append(
             {
@@ -744,7 +911,10 @@ def recognize_image_with_cnn(image_path, model=None, meta=None, model_path=MODEL
         raise RuntimeError(f"图片读取失败: {image_path}")
 
     components = component_candidates(image)
-    raw_candidates_by_position = [slot_candidates_for_position(components, meta, position) for position in range(4)]
+    raw_candidates_by_position = [
+        slot_candidates_for_position(components, meta, position, image=image)
+        for position in range(4)
+    ]
     boxes = [
         tuple(candidate["box"])
         for candidates in raw_candidates_by_position
