@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
-import getpass
 import http.cookiejar
+import json
 import os
 import ssl
 import sys
@@ -10,10 +10,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.cookiejar import Cookie
+from pathlib import Path
+
+from cnn_captcha import META_PATH, MODEL_PATH, load_char_cnn, recognize_image_with_cnn
 
 
 BASE_URL = "https://south-plus.org"
 LOGIN_URL = f"{BASE_URL}/login.php"
+DEFAULT_CONFIG = Path(__file__).with_name("sp_config.json")
 
 
 HEADERS = {
@@ -155,6 +159,46 @@ def submit_login(opener, args, gdcode):
     return status, headers, html
 
 
+def load_config(path):
+    config_path = Path(path).expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")
+    with config_path.open(encoding="utf-8") as fp:
+        config = json.load(fp)
+    if not isinstance(config, dict):
+        raise ValueError("配置文件根节点必须是 JSON object")
+    return config, config_path
+
+
+def config_get(config, *keys, default=None):
+    current = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def apply_config(args, config):
+    args.user = config_get(config, "account", "user") or config_get(config, "user")
+    args.password = config_get(config, "account", "password") or config_get(config, "password")
+    args.cookie = args.cookie if args.cookie is not None else config_get(config, "request", "cookie")
+    args.proxy = args.proxy if args.proxy is not None else config_get(config, "request", "proxy")
+    args.ca_file = args.ca_file if args.ca_file is not None else config_get(config, "request", "ca_file")
+    args.insecure = bool(args.insecure or config_get(config, "request", "insecure", default=False))
+    args.captcha_output = args.captcha_output or config_get(config, "captcha", "output", default="southplus/captcha.jpg")
+    args.cnn_model = args.cnn_model or config_get(config, "captcha", "model", default=str(MODEL_PATH))
+    args.cnn_meta = args.cnn_meta or config_get(config, "captcha", "meta", default=str(META_PATH))
+    args.max_attempts = int(args.max_attempts if args.max_attempts is not None else config_get(config, "login", "max_attempts", default=5))
+    args.retry_delay = float(args.retry_delay if args.retry_delay is not None else config_get(config, "login", "retry_delay", default=0.5))
+    args.jumpurl = args.jumpurl or config_get(config, "login", "jumpurl", default="//south-plus.org/index.php")
+    args.lgt = str(args.lgt or config_get(config, "login", "lgt", default="0"))
+    args.hideid = str(args.hideid or config_get(config, "login", "hideid", default="0"))
+    args.cktime = str(args.cktime or config_get(config, "login", "cktime", default="31536000"))
+    args.save_html = args.save_html or config_get(config, "login", "save_html", default="southplus/login_result.html")
+    return args
+
+
 def extract_title(html):
     lower = html.lower()
     start = lower.find("<title>")
@@ -169,46 +213,99 @@ def print_cookie_summary(cookie_jar):
     print("当前 Cookie:", ", ".join(names) if names else "(空)")
 
 
+def detect_login_result(status, headers, html):
+    if status in {301, 302, 303, 307, 308} and "login.php" not in headers.get("location", ""):
+        return "success"
+    if "认证码不正确或已过期" in html:
+        return "captcha_error"
+    if "用户名或密码错误" in html or "密码错误" in html:
+        return "password_error"
+    if "登录成功" in html or "顺利登录" in html:
+        return "success"
+    if "login.php" not in headers.get("location", "") and ("退出" in html or "用户中心" in html):
+        return "success"
+    return "unknown"
+
+
+def save_login_html(path, html):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(html)
+
+
+def recognize_captcha(image_path, model, meta):
+    result, debug = recognize_image_with_cnn(image_path, model=model, meta=meta)
+    debug_text = "|".join(
+        f"{item['digit']}:{item['source']}:{item['score']:.3f}:{item['box']}"
+        for item in debug
+    )
+    return result, debug_text
+
+
+def validate_args(args):
+    if not args.user or not args.password:
+        raise ValueError("配置文件必须提供 account.user 和 account.password")
+    if args.max_attempts < 0:
+        raise ValueError("max_attempts 不能小于 0；如需不限次数请设置为 0")
+    if args.lgt not in {"0", "1", "2"}:
+        raise ValueError("login.lgt 必须是 0、1 或 2")
+    if args.hideid not in {"0", "1"}:
+        raise ValueError("login.hideid 必须是 0 或 1")
+    if args.cktime not in {"31536000", "2592000", "86400", "3600", "0"}:
+        raise ValueError("login.cktime 不在允许值范围内")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="South Plus 登录纯协议脚本：获取验证码图片，人工输入验证码后提交登录。"
+        description="South Plus 登录纯协议脚本：读取配置，自动识别验证码并按配置重试登录。"
     )
-    parser.add_argument("-u", "--user", help="用户名 / UID / Email")
-    parser.add_argument("-p", "--password", help="密码；不传则交互输入")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="登录配置 JSON 路径")
     parser.add_argument(
         "-c",
         "--cookie",
-        help="可选，浏览器复制的 Cookie 字符串，例如 'cf_clearance=...; eb9e6_lastvisit=...'",
+        help="可选，覆盖配置中的 Cookie 字符串，例如 'cf_clearance=...; eb9e6_lastvisit=...'",
     )
-    parser.add_argument("--proxy", help="可选代理，例如 http://127.0.0.1:7890")
-    parser.add_argument("--ca-file", help="可选，自定义 CA 证书文件路径")
-    parser.add_argument("--insecure", action="store_true", help="临时关闭 TLS 证书校验，仅用于本地调试")
-    parser.add_argument("--captcha-output", default="southplus/captcha.jpg", help="验证码保存路径")
-    parser.add_argument("--jumpurl", default="//south-plus.org/index.php")
-    parser.add_argument("--lgt", choices=["0", "1", "2"], default="0", help="0 用户名，1 UID，2 Email")
-    parser.add_argument("--hideid", choices=["0", "1"], default="0", help="0 不隐身，1 隐身")
+    parser.add_argument("--proxy", help="可选，覆盖配置中的代理，例如 http://127.0.0.1:7890")
+    parser.add_argument("--ca-file", help="可选，覆盖配置中的自定义 CA 证书文件路径")
+    parser.add_argument("--insecure", action="store_true", help="覆盖配置，临时关闭 TLS 证书校验，仅用于本地调试")
+    parser.add_argument("--captcha-output", help="验证码保存路径")
+    parser.add_argument("--cnn-model", help="CNN 模型路径")
+    parser.add_argument("--cnn-meta", help="CNN 元数据路径")
+    parser.add_argument("--max-attempts", type=int, help="最大登录尝试次数；0 表示不限制")
+    parser.add_argument("--retry-delay", type=float, help="登录失败后重试间隔秒数")
+    parser.add_argument("--jumpurl")
+    parser.add_argument("--lgt", choices=["0", "1", "2"], help="0 用户名，1 UID，2 Email")
+    parser.add_argument("--hideid", choices=["0", "1"], help="0 不隐身，1 隐身")
     parser.add_argument(
         "--cktime",
         choices=["31536000", "2592000", "86400", "3600", "0"],
-        default="31536000",
         help="登录 Cookie 有效期",
     )
-    parser.add_argument("--save-html", default="southplus/login_result.html", help="保存登录响应 HTML")
+    parser.add_argument("--save-html", help="保存登录响应 HTML")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if not args.user:
-        args.user = input("账号: ").strip()
-    if not args.password:
-        args.password = getpass.getpass("密码: ")
+    try:
+        config, config_path = load_config(args.config)
+        args = apply_config(args, config)
+    except Exception as exc:
+        print(f"读取配置失败: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     cookie_jar = http.cookiejar.CookieJar()
     load_cookie_string(cookie_jar, args.cookie)
     opener = build_opener(cookie_jar, args)
 
-    print("[1/4] 请求登录页，建立会话")
+    print(f"配置文件: {config_path}")
+    print("[1/3] 请求登录页，建立会话")
     status, headers, body = request(opener, LOGIN_URL)
     if looks_like_cloudflare_block(status, headers, body):
         print("登录页可能被 Cloudflare 拦截。请从浏览器复制 cf_clearance 后用 --cookie 传入。")
@@ -219,40 +316,55 @@ def main():
         return 2
     print_cookie_summary(cookie_jar)
 
-    print("[2/4] 获取验证码图片")
-    captcha_url, content_type, size = save_captcha(opener, args.captcha_output)
-    print(f"验证码 URL: {captcha_url}")
-    print(f"验证码已保存: {os.path.abspath(args.captcha_output)} ({content_type}, {size} bytes)")
-    print_cookie_summary(cookie_jar)
+    print("[2/3] 加载验证码识别模型")
+    model, meta = load_char_cnn(
+        model_path=Path(args.cnn_model).expanduser().resolve(),
+        meta_path=Path(args.cnn_meta).expanduser().resolve(),
+    )
 
-    gdcode = input("[3/4] 打开验证码图片并输入验证码: ").strip()
-    if not gdcode:
-        print("验证码不能为空")
-        return 2
+    attempt = 0
+    while args.max_attempts == 0 or attempt < args.max_attempts:
+        attempt += 1
+        total_text = "不限" if args.max_attempts == 0 else str(args.max_attempts)
+        print(f"[3/3] 第 {attempt}/{total_text} 次获取验证码并提交登录")
+        try:
+            captcha_url, content_type, size = save_captcha(opener, args.captcha_output)
+            gdcode, debug_text = recognize_captcha(Path(args.captcha_output).expanduser().resolve(), model, meta)
+            if not gdcode:
+                print("验证码识别为空，准备重试")
+                continue
+            print(f"验证码 URL: {captcha_url}")
+            print(f"验证码已保存: {os.path.abspath(args.captcha_output)} ({content_type}, {size} bytes)")
+            print(f"识别结果: {gdcode}")
+            print(f"识别调试: {debug_text}")
 
-    print("[4/4] 提交登录表单")
-    status, headers, html = submit_login(opener, args, gdcode)
-    os.makedirs(os.path.dirname(os.path.abspath(args.save_html)), exist_ok=True)
-    with open(args.save_html, "w", encoding="utf-8") as fp:
-        fp.write(html)
+            status, headers, html = submit_login(opener, args, gdcode)
+            save_login_html(args.save_html, html)
+            title = extract_title(html)
+            result = detect_login_result(status, headers, html)
+            print(f"HTTP 状态: {status}")
+            print(f"响应标题: {title or '(未提取到 title)'}")
+            print(f"响应 HTML: {os.path.abspath(args.save_html)}")
+            print_cookie_summary(cookie_jar)
+        except Exception as exc:
+            print(f"本次登录尝试失败: {exc}")
+            result = "unknown"
 
-    title = extract_title(html)
-    print(f"HTTP 状态: {status}")
-    print(f"响应标题: {title or '(未提取到 title)'}")
-    print(f"响应 HTML: {os.path.abspath(args.save_html)}")
-    print_cookie_summary(cookie_jar)
+        if result == "success":
+            print("结果: 登录成功。")
+            return 0
+        if result == "password_error":
+            print("结果: 账号或密码错误，停止重试。")
+            return 1
+        if result == "captcha_error":
+            print("结果: 验证码错误或已过期，准备获取新验证码重试。")
+        else:
+            print("结果: 未确认登录成功，准备重试。")
+        if args.retry_delay > 0:
+            time.sleep(args.retry_delay)
 
-    if "认证码不正确或已过期" in html:
-        print("结果: 验证码错误或已过期。需要重新运行脚本获取新的验证码。")
-        return 1
-    if "用户名或密码错误" in html or "密码错误" in html:
-        print("结果: 验证码已通过，但账号或密码错误。")
-        return 1
-    if "login.php" not in headers.get("location", "") and ("退出" in html or "用户中心" in html):
-        print("结果: 可能登录成功，请检查响应 HTML 和 Cookie。")
-        return 0
-    print("结果: 已提交，请根据响应标题和保存的 HTML 判断是否成功。")
-    return 0
+    print("结果: 达到最大登录尝试次数，仍未登录成功。")
+    return 1
 
 
 if __name__ == "__main__":

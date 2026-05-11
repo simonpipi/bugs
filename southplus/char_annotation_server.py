@@ -37,7 +37,7 @@ INDEX_HTML = r"""<!doctype html>
     section { padding: 20px; overflow: auto; }
     .top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 14px; }
     .title { font-size: 22px; font-weight: 700; margin-right: 12px; }
-    .label { font-size: 20px; font-weight: 700; letter-spacing: 4px; padding: 5px 10px; background: #fff; border: 1px solid #d0d0ca; border-radius: 6px; }
+    .label-input { width: 120px; font-size: 20px; font-weight: 700; letter-spacing: 4px; padding: 5px 10px; background: #fff; border: 1px solid #d0d0ca; border-radius: 6px; }
     button { padding: 8px 12px; border: 1px solid #aaa; border-radius: 6px; background: #fff; cursor: pointer; }
     button:hover { background: #f1f1ed; }
     button.primary { color: #fff; border-color: #1761d1; background: #1761d1; }
@@ -63,7 +63,7 @@ INDEX_HTML = r"""<!doctype html>
   <section>
     <div class="top">
       <div class="title" id="title">加载中</div>
-      <div class="label" id="label"></div>
+      <input id="labelInput" class="label-input" maxlength="4" inputmode="numeric" pattern="[0-9]*" placeholder="4位">
       <button id="prev">上一张</button>
       <button id="next">下一张</button>
       <button id="clear">清空本张</button>
@@ -148,8 +148,12 @@ function draw() {
 }
 
 function digitFor(pos) {
-  const label = images[current]?.label || "";
+  const label = currentLabel();
   return label[pos] || "";
+}
+
+function currentLabel() {
+  return ($("labelInput").value || "").replace(/\D+/g, "").slice(0, 4);
 }
 
 function renderBoxCards() {
@@ -190,7 +194,7 @@ async function loadImage(idx) {
   const item = images[current];
   currentFile = item.file;
   $("title").textContent = `${String(item.index).padStart(3, "0")} ${item.file}`;
-  $("label").textContent = item.label || "无 label";
+  $("labelInput").value = item.label || "";
   boxes = [null, null, null, null];
   const ann = await api(`/api/annotation?file=${encodeURIComponent(item.file)}`);
   ann.boxes.forEach(b => { boxes[b.pos] = { x: b.x, y: b.y, w: b.w, h: b.h }; });
@@ -212,17 +216,21 @@ async function saveCurrent(goNext = true) {
 async function saveSnapshot(file, snapshotBoxes) {
   if (!file) return;
   const item = images.find(row => row.file === file);
-  const label = item?.label || "";
+  const label = file === currentFile ? currentLabel() : (item?.label || "");
   const payload = {
     file,
+    label,
     boxes: snapshotBoxes.map((box, pos) => box ? ({ ...box, pos, digit: label[pos] || "" }) : null).filter(Boolean),
   };
-  await api("/api/annotation", {
+  const result = await api("/api/annotation", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (item) item.done = payload.boxes.length === 4;
+  if (item) {
+    item.label = result.label || label;
+    item.done = payload.boxes.length === 4 && item.label.length === 4;
+  }
   if (file === currentFile) dirty = false;
   if (saveTimer) {
     clearTimeout(saveTimer);
@@ -262,6 +270,13 @@ window.addEventListener("mouseup", () => {
 });
 
 window.addEventListener("keydown", evt => {
+  if (evt.target && evt.target.tagName === "INPUT") {
+    if (evt.key === "Enter") {
+      evt.preventDefault();
+      saveCurrent(true);
+    }
+    return;
+  }
   if (evt.key >= "1" && evt.key <= "4") {
     currentPos = Number(evt.key) - 1;
     draw();
@@ -292,13 +307,21 @@ $("clear").onclick = () => {
 };
 $("save").onclick = () => saveCurrent(true);
 $("filter").oninput = renderList;
+$("labelInput").addEventListener("input", () => {
+  const normalized = currentLabel();
+  if ($("labelInput").value !== normalized) $("labelInput").value = normalized;
+  if (images[current]) images[current].label = normalized;
+  markDirty();
+  draw();
+});
 
 window.addEventListener("beforeunload", () => {
   if (!dirty || !currentFile) return;
   const item = images.find(row => row.file === currentFile);
-  const label = item?.label || "";
+  const label = currentLabel() || item?.label || "";
   const payload = JSON.stringify({
     file: currentFile,
+    label,
     boxes: boxes.map((box, pos) => box ? ({ ...box, pos, digit: label[pos] || "" }) : null).filter(Boolean),
   });
   navigator.sendBeacon("/api/annotation", new Blob([payload], { type: "application/json" }));
@@ -310,7 +333,8 @@ api("/api/images").then(data => {
   loadImage(0);
 }).catch(err => {
   $("title").textContent = "加载失败";
-  $("label").textContent = err.message;
+  $("labelInput").value = "";
+  alert(err.message);
 });
 </script>
 </body>
@@ -332,6 +356,63 @@ def read_labels():
             if file_name:
                 labels[file_name] = clean_digit(row.get("label"))
     return labels
+
+
+def read_label_rows():
+    default_fieldnames = [
+        "index",
+        "file",
+        "result",
+        "whole",
+        "segment",
+        "raw",
+        "boxes",
+        "ok",
+        "content_type",
+        "size",
+        "url",
+        "error",
+        "label",
+    ]
+    if not LABELS_CSV.exists():
+        return default_fieldnames, []
+    with LABELS_CSV.open(newline="", encoding="utf-8-sig") as fp:
+        reader = csv.DictReader(fp)
+        return reader.fieldnames or default_fieldnames, list(reader)
+
+
+def write_label(file_name, label):
+    label = clean_digit(label)[:4]
+    fieldnames, rows = read_label_rows()
+    if "label" not in fieldnames:
+        fieldnames.append("label")
+    if "file" not in fieldnames:
+        fieldnames.insert(0, "file")
+    if "index" not in fieldnames:
+        fieldnames.insert(0, "index")
+
+    target = None
+    for row in rows:
+        if row.get("file") == file_name:
+            target = row
+            break
+    if target is None:
+        match = re.search(r"(\d+)", Path(file_name).stem)
+        target = {key: "" for key in fieldnames}
+        target["index"] = str(int(match.group(1))) if match else ""
+        target["file"] = file_name
+        rows.append(target)
+    target["label"] = label
+
+    rows.sort(key=lambda row: int(row.get("index") or 0))
+    if LABELS_CSV.exists():
+        backup_path = LABELS_CSV.with_suffix(".csv.bak")
+        backup_path.write_text(LABELS_CSV.read_text(encoding="utf-8"), encoding="utf-8")
+    with LABELS_CSV.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return label
 
 
 def read_char_labels():
@@ -412,7 +493,7 @@ class Handler(BaseHTTPRequestHandler):
                         "index": index,
                         "file": image_path.name,
                         "label": labels.get(image_path.name, ""),
-                        "done": len(boxes) == 4,
+                        "done": len(boxes) == 4 and len(labels.get(image_path.name, "")) == 4,
                     }
                 )
             self.send_json({"images": images})
@@ -454,7 +535,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "图片不存在"}, status=400)
             return
         labels = read_labels()
-        label = labels.get(file_name, "")
+        payload_label = clean_digit(payload.get("label"))[:4]
+        label = write_label(file_name, payload_label) if "label" in payload else labels.get(file_name, "")
         rows = []
         for item in payload.get("boxes", []):
             pos = int(item.get("pos", 0))
@@ -476,7 +558,7 @@ class Handler(BaseHTTPRequestHandler):
         annotations = read_char_labels()
         annotations[file_name] = rows
         write_char_labels(annotations)
-        self.send_json({"ok": True, "saved": len(rows)})
+        self.send_json({"ok": True, "saved": len(rows), "label": label})
 
 
 def main():

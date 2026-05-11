@@ -1,36 +1,34 @@
-# South Plus 验证码识别说明
+# South Plus 验证码识别
 
-本目录包含 South Plus 数字验证码的本地识别、训练、评估和错例诊断脚本。当前主力方案是“槽位候选框 + 单字符 CNN 分类 + 序列约束搜索”，不依赖在线 OCR 服务。
+本目录只保留当前主路径：槽位候选框 + 单字符 CNN 分类 + 序列约束搜索。
 
-## 目录结构
+旧的 ddddocr、HOG/SVM、未接入 rerank 实验脚本已经清理，避免继续维护多套过期算法。
 
-- `cnn_captcha.py`：CNN 识别核心逻辑，包含候选框生成、批量分类、几何 rerank、四槽位序列选择。
-- `recognize_captcha_cnn.py`：识别单张验证码图片。
-- `train_char_cnn.py`：用 `char_labels.csv` 训练单字符 CNN。
-- `evaluate_cnn_captcha.py`：批量评估验证码整体准确率和字符准确率。
+## 文件说明
+
+- `cnn_captcha.py`：CNN 识别核心逻辑，包含候选框生成、批量分类、候选打分和四槽位序列选择。
+- `recognize_captcha_cnn.py`：识别单张验证码。
+- `batch_captcha_verify.py`：批量下载验证码，并使用当前 CNN 算法识别和生成复核拼图。
+- `train_char_cnn.py`：训练单字符 CNN。
+- `evaluate_cnn_captcha.py`：批量评估整题准确率和字符准确率。
 - `evaluate_candidate_recall.py`：诊断候选框召回率和正确候选排名。
-- `analyze_cnn_mismatches.py`：分析最终错例来源、混淆数字和典型样本。
-- `mine_hard_negatives.py`：从误选框中挖 hard negatives，作为背景类重训样本。
-- `captcha_samples/labels.csv`：验证码整题标签。
-- `captcha_samples/char_labels.csv`：字符级标注框。
+- `analyze_cnn_mismatches.py`：分析错例来源、混淆数字和典型样本。
+- `mine_hard_negatives.py`：从误选框中挖 hard negatives。
 - `captcha_char_cnn.pt` / `captcha_char_cnn_meta.json`：当前 CNN 模型和元数据。
+- `captcha_samples/labels.csv`：整题标签。
+- `captcha_samples/char_labels.csv`：字符级标注框。
 
 ## 环境准备
-
-建议在虚拟环境中安装依赖：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r southplus/requirements-captcha.txt
-pip install opencv-python numpy
 ```
 
-如果本机已有 `torch`、`cv2`、`numpy`，可以直接运行脚本。
+## 使用
 
-## 快速使用
-
-识别单张验证码：
+识别单张：
 
 ```bash
 python3 southplus/recognize_captcha_cnn.py southplus/captcha_samples/captcha_001.jpg
@@ -42,7 +40,26 @@ python3 southplus/recognize_captcha_cnn.py southplus/captcha_samples/captcha_001
 python3 southplus/recognize_captcha_cnn.py southplus/captcha_samples/captcha_001.jpg --debug
 ```
 
-批量评估当前模型，推荐输出到 `/tmp`，避免覆盖工作区已有结果：
+下载并识别 5 张新图：
+
+```bash
+python3 southplus/batch_captcha_verify.py \
+  -n 5 \
+  -o /tmp/southplus_live_check \
+  --results-file /tmp/southplus_live_check/results.csv \
+  --insecure
+```
+
+协议登录：
+
+```bash
+cp southplus/sp_config.example.json southplus/sp_config.json
+python3 southplus/sp.py --config southplus/sp_config.json
+```
+
+`sp_config.json` 中配置账号、密码、Cookie/代理、CNN 模型路径和 `login.max_attempts`。真实配置文件已加入 `.gitignore`，不要提交账号密码；`max_attempts=0` 表示不限次数，验证码识别或登录未确认成功时会重新获取验证码继续提交。
+
+批量评估：
 
 ```bash
 python3 southplus/evaluate_cnn_captcha.py \
@@ -50,154 +67,237 @@ python3 southplus/evaluate_cnn_captcha.py \
   --mismatches /tmp/cnn_mismatches.csv
 ```
 
-诊断候选框召回：
+候选召回诊断：
 
 ```bash
 python3 southplus/evaluate_candidate_recall.py
 ```
 
-分析错例：
+错例分析：
 
 ```bash
 python3 southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results.csv
 ```
 
-导出同框误分类 hard positives 和 crop：
+## 当前效果
+
+在 250 张已标注样本上的当前最佳结果：
+
+```text
+sequence=221/250=88.40%
+character=967/1000=96.70%
+raw_candidate_recall@0.45=1000/1000=100.00%
+ranked_recall@1=877/1000=87.70%
+ranked_recall@10=974/1000=97.40%
+```
+
+剩余主要错误：
+
+```text
+wrong_slots=33
+fallback_or_scan_miss=16
+same_box_classification=9
+wrong_component_box=6
+tiny_noise_component=2
+```
+
+## 下一步优化计划
+
+目标：把整题成功率从当前 `83.60%` 推到 `85% - 90%` 区间。按 250 张样本计算，`85%` 至少需要 `213/250`，相比当前 `209/250` 需要多对 4 题；`90%` 需要 `225/250`，需要多对 16 题。
+
+状态说明：
+
+- `未开始`：尚未执行。
+- `进行中`：正在改代码、调参或补样本。
+- `待验证`：已有改动或实验结果，但还没完成全量评估。
+- `已完成`：全量评估达成该阶段目标，并记录结果。
+- `放弃`：实验收益不足或回退风险过高，不进入主路径。
+
+### 阶段一：候选召回修复
+
+- 状态：`已完成`
+- 目标区间：`85% - 87%`
+- 预期收益：多对 `4 - 8` 题。
+- 主要错误来源：`fallback_or_scan_miss=20`
+- 执行内容：
+  - 导出并复核 `fallback_or_scan_miss` 错例，区分“正确框未生成”和“正确框生成但排名靠后”。
+  - 优化 `slot_scan`、`template_scan`、`template_local` 的候选生成，重点覆盖低位 `0/1/5`、细窄字符、断裂字符。
+  - 对漏召回槽位做定向补框，避免全局放宽阈值引入大量噪声。
+  - 使用候选召回诊断确认 `raw_candidate_recall` 和 `ranked_recall` 是否提升。
+- 验证命令：
+
+```bash
+python3 southplus/evaluate_candidate_recall.py
+python3 southplus/evaluate_cnn_captcha.py \
+  --output /tmp/cnn_results.csv \
+  --mismatches /tmp/cnn_mismatches.csv
+python3 southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results.csv
+```
+
+- 完结标准：
+  - 整题准确率达到或超过 `85%`。
+  - `fallback_or_scan_miss` 数量明显下降。
+  - 新增候选没有导致明显 `wrong_component_box` 或 `tiny_noise_component` 回退。
+- 结果记录：
+  - 基线：`sequence=209/250=83.60%`
+  - 完结结果：`sequence=213/250=85.20%`，`character=958/1000=95.80%`，`raw_candidate_recall@0.45=1000/1000=100.00%`
+
+### 阶段二：候选打分和后验规则
+
+- 状态：`已完成`
+- 目标区间：`87% - 88.5%`
+- 预期收益：在阶段一基础上多对 `2 - 5` 题。
+- 主要处理对象：正确框已进入候选集，但排序靠后或四槽位联合搜索误选。
+- 执行内容：
+  - 扫描 `BACKGROUND_SCORE_WEIGHT`、`SLOT_SCAN_SOURCE_PENALTY`、`TEMPLATE_SCAN_SOURCE_PENALTY`、`TEMPLATE_LOCAL_SOURCE_PENALTY`、`TEMPLATE_MATCH_BONUS`、`POSITION_FALLBACK_SOURCE_PENALTY`。
+  - 使用 `--rule-check-regressions` 检查规则是否造成基线正确样本回退。
+  - 只接受低风险、可解释、收益明确的单条或少量组合规则。
+- 验证命令：
+
+```bash
+python3 southplus/tune_cnn_scoring.py \
+  --rule-scan \
+  --rule-check-regressions \
+  --top 20 \
+  --rule-output /tmp/southplus_rule_scan.json
+```
+
+- 完结标准：
+  - 整题准确率达到或超过 `87%`。
+  - 规则扫描显示净收益为正。
+  - 回退样本数量可接受，并逐条确认原因。
+- 结果记录：
+  - 阶段输入结果：`sequence=213/250=85.20%`
+  - 阶段性结果：`sequence=214/250=85.60%`，`character=959/1000=95.90%`
+  - 完结结果：`sequence=218/250=87.20%`，`character=964/1000=96.40%`，`raw_candidate_recall@0.45=1000/1000=100.00%`
+
+### 阶段三：same-box 分类增强
+
+- 状态：`已完成`
+- 目标区间：`88% - 90%`
+- 预期收益：多对 `2 - 6` 题，但存在模型回退风险。
+- 主要错误来源：`same_box_classification=16`
+- 执行内容：
+  - 导出 same-box hard positives 和 crop 图片，人工复核是否标注可靠。
+  - 只训练 `/tmp` 临时模型，不直接覆盖正式模型。
+  - 对比临时模型和当前正式模型的整题准确率、字符准确率、错例分布。
+  - 如果 hard positives 导致整体回退，则标记该实验为 `放弃`，不进入主路径。
+- 验证命令：
 
 ```bash
 python3 southplus/analyze_cnn_mismatches.py \
   --results /tmp/cnn_results.csv \
-  --hard-positives-output southplus/captcha_samples/hard_positives.csv \
-  --export-same-box-crops southplus/captcha_samples/same_box_crops
+  --hard-positives-output /tmp/hard_positives.csv \
+  --export-same-box-crops /tmp/same_box_crops
+
+python3 southplus/train_char_cnn.py \
+  --hard-positives /tmp/hard_positives.csv \
+  --model /tmp/captcha_char_cnn_hp.pt \
+  --meta /tmp/captcha_char_cnn_hp_meta.json
+
+python3 southplus/evaluate_cnn_captcha.py \
+  --model /tmp/captcha_char_cnn_hp.pt \
+  --meta /tmp/captcha_char_cnn_hp_meta.json \
+  --output /tmp/cnn_results_hp.csv \
+  --mismatches /tmp/cnn_mismatches_hp.csv
 ```
 
-## 当前最终效果
+- 完结标准：
+  - 临时模型整题准确率达到或超过阶段二结果。
+  - same-box 分类错误下降，且其他错误桶没有明显增加。
+  - 达到 `88% - 90%` 后，再考虑是否替换正式模型。
+- 结果记录：
+  - 阶段输入结果：`sequence=218/250=87.20%`
+  - 临时 hard-positive 模型结果：`sequence=175/250=70.00%`，`character=923/1000=92.30%`，结论为放弃，不替换正式模型。
+  - 后验规则完结结果：`sequence=221/250=88.40%`，`character=967/1000=96.70%`
+  - 是否替换正式模型：不替换；保留正式 CNN，接入低风险 same-box 后验规则。
 
-在 200 张已标注样本上，当前版本验证结果：
+### 回溯记录模板
+
+每轮实验完成后，在下面追加一条记录：
 
 ```text
-sequence: 142/200 = 71.00%
-character: 735/800 = 91.88%
+日期：
+阶段：
+状态：
+改动摘要：
+验证命令：
+sequence：
+character：
+错例分布：
+结论：
+下一步：
 ```
 
-候选框诊断结果：
+### 回溯记录
 
 ```text
-raw_candidate_recall@0.45: 760/800 = 95.00%
-ranked_recall@1:        672/800 = 84.00%
-ranked_recall@3:        719/800 = 89.88%
-ranked_recall@10:       741/800 = 92.62%
+日期：2026-05-09
+阶段：阶段一：候选召回修复
+状态：已完成
+改动摘要：新增 slot_scan_templates_v4，对低位 0/1/5 补充与现有模板 IoU<0.45 的经验模板；新增 top2 低置信 template_scan 0 候选 +0.20 后验加分。
+验证命令：
+  southplus/.venv/bin/python southplus/evaluate_cnn_captcha.py --output /tmp/cnn_results_opt.csv --mismatches /tmp/cnn_mismatches_opt.csv
+  southplus/.venv/bin/python southplus/evaluate_candidate_recall.py
+  southplus/.venv/bin/python southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results_opt.csv
+sequence：213/250=85.20%
+character：958/1000=95.80%
+错例分布：wrong_slots=42, fallback_or_scan_miss=17, same_box_classification=16, wrong_component_box=7, tiny_noise_component=2
+结论：阶段一达到 85% 门槛，raw_candidate_recall@0.45 提升到 100.00%，无 raw miss。
+下一步：进入阶段二，优先处理 ranked_recall@1 和 same-box 分类/高背景模板误选。
 ```
-
-## 优化版本记录
-
-### V0：早期传统方案
-
-入口主要是 `recognize_captcha.py`、`recognize_captcha_svm.py` 和 SVM 相关脚本。
-
-特点：
-
-- 使用图像预处理、连通域和 HOG/SVM 单字符分类。
-- 对粘连、噪声、小字符、位置漂移比较敏感。
-- 更适合做基线和样本导出，不再是当前推荐主路径。
-
-### V1：槽位 CNN 基线
-
-核心改动：
-
-- 使用 `SlotCharCNN` 做单字符分类。
-- 每个验证码拆成 4 个槽位，各槽位生成候选框。
-- 候选来源包括 `component`、`slot_scan`、`position_fallback`。
-- 通过 `select_best_sequence` 做四槽位单调位置约束，避免选到重叠框或乱序框。
-
-主要问题：
-
-- 正确框经常没有进入候选集。
-- 小 `1`、低位 `0/5`、大框误选较多。
-- 单纯调 `slot_scan` 惩罚或给 `component` 加分没有稳定收益。
-
-参数验证结论：
 
 ```text
-baseline: 102/200 = 51.00%, character 676/800 = 84.50%
-提高 slot_scan penalty: 无稳定提升，通常下降
-component 小加分: 最多只提升 1 个字符，不提升整题
+日期：2026-05-09
+阶段：阶段二：候选打分和后验规则
+状态：进行中
+改动摘要：新增 top2 短高 template_scan 0 候选 +0.20 后验加分，条件为 digit=0、source=template_scan、height<=12。
+验证命令：
+  southplus/.venv/bin/python southplus/evaluate_cnn_captcha.py --output /tmp/cnn_results_opt2.csv --mismatches /tmp/cnn_mismatches_opt2.csv
+  southplus/.venv/bin/python southplus/evaluate_candidate_recall.py
+  southplus/.venv/bin/python southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results_opt2.csv
+sequence：214/250=85.60%
+character：959/1000=95.90%
+错例分布：wrong_slots=41, fallback_or_scan_miss=17, same_box_classification=15, wrong_component_box=7, tiny_noise_component=2
+结论：阶段二获得阶段性净增 1 题；相对原始基线净增 5 题，无原正确样本回退。
+下一步：继续寻找可解释的组合规则；若规则收益耗尽，转入 same-box hard positives 临时模型实验。
 ```
-
-### V2：多模板候选增强
-
-当前主版本。
-
-核心改动在 `cnn_captcha.py`：
-
-- 新增 `compute_slot_scan_templates_v2`。
-- 对每个 `position + digit` 从字符标注分布中取多个代表框，而不是只取一个中位模板。
-- 模板按 `y/x` 排序后取首位、中位、末位，样本足够时再取四分位点。
-- 加载旧 `captcha_char_cnn_meta.json` 时，如果缺少 `slot_scan_templates_v2`，会从 `char_labels.csv` 即时计算，不需要重训模型。
-- 识别时优先使用 `slot_scan_templates_v2`，旧字段 `slot_scan_templates` 作为 fallback。
-
-收益：
 
 ```text
-raw_candidate_recall@0.45: 83.25% -> 94.38%
-ranked_recall@1:          73.12% -> 84.00%
-sequence:                 102/200 -> 137/200
-character:                676/800 -> 729/800
+日期：2026-05-09
+阶段：阶段二：候选打分和后验规则
+状态：已完成
+改动摘要：新增 top4 后验规则：低置信 template_scan 0 候选 +0.20；position=1 的 template_scan 6 候选 +0.40；position=1 的 slot_scan 1 候选 -0.20。
+验证命令：
+  southplus/.venv/bin/python southplus/evaluate_cnn_captcha.py --output /tmp/cnn_results_stage2_final.csv --mismatches /tmp/cnn_mismatches_stage2_final.csv
+  southplus/.venv/bin/python southplus/evaluate_candidate_recall.py
+  southplus/.venv/bin/python southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results_stage2_final.csv
+  southplus/.venv/bin/python southplus/tune_cnn_scoring.py --rule-scan --rule-check-regressions --rule-top-k 4 --top 12 --rule-output /tmp/southplus_rule_scan_stage2_done.json
+sequence：218/250=87.20%
+character：964/1000=96.40%
+错例分布：wrong_slots=36, fallback_or_scan_miss=16, same_box_classification=12, wrong_component_box=6, tiny_noise_component=2
+结论：阶段二达到 87% 门槛；最终规则扫描已无正收益单条规则，候选召回 raw_candidate_recall@0.45 维持 100.00%。
+下一步：进入阶段三，只用 /tmp 临时模型评估 same-box hard positives，避免直接覆盖正式模型。
 ```
-
-### V2.1：模板源打分微调
-
-在 v2 候选增强后，重新验证模板源参数：
-
-```python
-TEMPLATE_SCAN_SOURCE_PENALTY = 0.30
-TEMPLATE_MATCH_BONUS = 0.10
-TEMPLATE_MISMATCH_PENALTY = 0.05
-```
-
-对比 v2 初始参数：
 
 ```text
-v2 初始: sequence 136/200, character 727/800
-v2.1:    sequence 137/200, character 729/800
-```
-
-这个收益不大，但没有观察到回退样本，因此保留。
-
-### V2.2：局部模板搜索和 hard positive 导出
-
-核心改动：
-
-- `template_scan` 候选会额外尝试基于局部前景的 `template_local` 精修框，补齐轻微偏移的模板命中。
-- 对 `template_local` 做尺寸收紧，避免局部前景合并成大框后抢分。
-- 对 `1` 类加入温和窄框先验，压低过小噪点和过大模板框，但保留真实 `1` 的宽高波动。
-- `evaluate_candidate_recall.py` 改为按图片缓存候选和 CNN 分类结果，避免每个字符槽位重复识别同一张图片。
-- `analyze_cnn_mismatches.py` 支持导出 `same_box_classification` 为 hard positive CSV 和 crop 图片。
-- `train_char_cnn.py` 支持 `--hard-positives`，可把导出的同框错例作为正样本补充训练。
-
-对比 v2.1：
-
-```text
-sequence:  137/200 -> 140/200
-character: 729/800 -> 732/800
-raw_candidate_recall@0.45: 755/800 -> 760/800
-```
-
-### V2.3：局部模板候选降惩罚
-
-核心改动：
-
-- 将 `TEMPLATE_LOCAL_SOURCE_PENALTY` 从 `0.32` 调整为 `0.0`。
-- 离线对比 `template_local` 惩罚、模板惩罚、模板匹配奖励、背景惩罚和裁剪 pad 组合后，只有局部模板降惩罚有稳定收益。
-- 通用数字形状惩罚和替换 `CLASSIFY_PADS=(1,3,5)` 均未带来收益，因此不保留。
-- 直接把 29 个 hard positives 并入默认训练会明显回退，模型文件未替换。
-
-对比 v2.2：
-
-```text
-sequence:  140/200 -> 142/200
-character: 732/800 -> 735/800
-wrong_slots: 68 -> 65
+日期：2026-05-09
+阶段：阶段三：same-box 分类增强
+状态：已完成
+改动摘要：导出 12 条 same-box hard positives 并训练 /tmp 临时模型；临时模型大幅回退后放弃。改为接入 3 条 top4 局部后验规则：position=1 的 template_scan 4 且模板匹配 +0.30；position=3 的 template_scan 2 且模板匹配 +0.40；position=2 的 slot_scan 1 额外 -0.40。
+验证命令：
+  southplus/.venv/bin/python southplus/evaluate_cnn_captcha.py --output /tmp/cnn_results_stage3_base.csv --mismatches /tmp/cnn_mismatches_stage3_base.csv
+  southplus/.venv/bin/python southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results_stage3_base.csv --hard-positives-output /tmp/hard_positives_stage3.csv --export-same-box-crops /tmp/same_box_crops_stage3
+  southplus/.venv/bin/python southplus/train_char_cnn.py --hard-positives /tmp/hard_positives_stage3.csv --model /tmp/captcha_char_cnn_stage3_hp.pt --meta /tmp/captcha_char_cnn_stage3_hp_meta.json
+  southplus/.venv/bin/python southplus/evaluate_cnn_captcha.py --model /tmp/captcha_char_cnn_stage3_hp.pt --meta /tmp/captcha_char_cnn_stage3_hp_meta.json --output /tmp/cnn_results_stage3_hp.csv --mismatches /tmp/cnn_mismatches_stage3_hp.csv
+  southplus/.venv/bin/python southplus/evaluate_cnn_captcha.py --output /tmp/cnn_results_stage3_rules.csv --mismatches /tmp/cnn_mismatches_stage3_rules.csv
+  southplus/.venv/bin/python southplus/analyze_cnn_mismatches.py --results /tmp/cnn_results_stage3_rules.csv
+  southplus/.venv/bin/python southplus/evaluate_candidate_recall.py
+sequence：221/250=88.40%
+character：967/1000=96.70%
+错例分布：wrong_slots=33, fallback_or_scan_miss=16, same_box_classification=9, wrong_component_box=6, tiny_noise_component=2
+结论：阶段三达到 88% 门槛；same_box_classification 从 12 降到 9。hard-positive 临时模型结果为 175/250=70.00%，不替换正式模型。
+下一步：若继续冲 90%，优先处理 fallback_or_scan_miss=16 中 rank 靠后的低位 0/5/1 和底部小字符。
 ```
 
 ## 当前识别流程
@@ -205,96 +305,68 @@ wrong_slots: 68 -> 65
 1. 读取图片。
 2. 用 `component_candidates` 生成连通域候选。
 3. 用槽位中心范围过滤跨槽候选。
-4. 加入 `position_fallback` 和若干 `slot_scan` 扫描框。
-5. 加入 `slot_scan_templates_v2` 模板候选和局部前景精修候选。
-6. 用 CNN 对所有候选框批量分类。
-7. 对每个候选按以下因素打分：
-   - 数字概率
-   - 背景类概率惩罚
-   - 槽位中心距离惩罚
-   - 来源优先级惩罚
-   - 模板数字匹配加分或不匹配惩罚
-   - 数字框宽高几何先验
-   - `1` 类窄框先验
-8. 四个槽位联合搜索，要求位置单调且候选框不严重冲突。
+4. 加入 `position_fallback`、`slot_scan` 和模板扫描候选。
+5. 使用 `slot_scan_templates_v3` 对低位 `0/1/5` 增强模板召回。
+6. 使用 `slot_scan_templates_v4` 对低位 `0/1/5` 继续补充低 IoU 经验模板。
+7. 对模板附近前景做 `template_local` 精修。
+8. 用 CNN 对所有候选框批量分类。
+9. 按数字概率、背景概率、槽位距离、候选来源、模板匹配和后验规则打分。
+10. 四槽位联合搜索，要求位置单调且候选框不严重冲突。
 
-## 训练流程
+## 训练
 
-重新训练 CNN：
+重新训练正式 CNN：
 
 ```bash
 python3 southplus/train_char_cnn.py
 ```
 
-常用参数：
+训练临时模型做实验：
 
 ```bash
 python3 southplus/train_char_cnn.py \
-  --epochs 35 \
-  --batch-size 64 \
-  --lr 1e-3 \
-  --negative-per-file 8
+  --model /tmp/captcha_char_cnn_exp.pt \
+  --meta /tmp/captcha_char_cnn_exp_meta.json
 ```
 
-训练会写入：
-
-- `southplus/captcha_char_cnn.pt`
-- `southplus/captcha_char_cnn_meta.json`
-
-如需加入 hard negatives：
+挖 hard negatives 后重训：
 
 ```bash
 python3 southplus/mine_hard_negatives.py
 python3 southplus/train_char_cnn.py --hard-negatives southplus/captcha_samples/hard_negatives.csv
 ```
 
-如需加入同框误分类 hard positives：
+导出 same-box hard positives 做临时实验：
 
 ```bash
 python3 southplus/analyze_cnn_mismatches.py \
   --results /tmp/cnn_results.csv \
-  --hard-positives-output southplus/captcha_samples/hard_positives.csv \
-  --export-same-box-crops southplus/captcha_samples/same_box_crops
+  --hard-positives-output /tmp/hard_positives.csv \
+  --export-same-box-crops /tmp/same_box_crops
 python3 southplus/train_char_cnn.py \
-  --hard-positives southplus/captcha_samples/hard_positives.csv \
+  --hard-positives /tmp/hard_positives.csv \
   --model /tmp/captcha_char_cnn_hp.pt \
   --meta /tmp/captcha_char_cnn_hp_meta.json
 ```
 
-注意：hard positives 直接并入默认训练未必提升整题识别。当前验证中临时模型为 `sequence 97/200`、`character 677/800`，因此没有替换现有模型；后续需要先调采样权重或训练策略，再用 `/tmp` 模型评估通过后再覆盖正式模型。
+注意：hard positives 曾导致整题回退，正式替换模型前必须先用 `/tmp` 临时模型完整评估。
 
-## 错例分析
+## 调参
 
-当前最终版剩余错位：
+扫描候选打分参数：
 
-```text
-wrong_slots: 65
-fallback_or_scan_miss: 29
-same_box_classification: 28
-tiny_noise_component: 5
-wrong_component_box: 3
+```bash
+python3 southplus/tune_cnn_scoring.py
 ```
 
-高频混淆：
+扫描低风险后验规则：
 
-```text
-3 -> 9: 10
-5 -> 0: 7
-5 -> 1: 6
-0 -> 9: 5
-1 -> 9: 5
-7 -> 9: 5
-5 -> 9: 4
+```bash
+python3 southplus/tune_cnn_scoring.py \
+  --rule-scan \
+  --rule-check-regressions \
+  --top 20 \
+  --rule-output /tmp/southplus_rule_scan.json
 ```
 
-这说明候选框问题已经明显减少，下一步收益主要来自两类方向：
-
-- 继续提高模板候选精度，减少 `template_scan` 大框/错位框。
-- 针对 `3/5/0/1/7/9` 做 hard example 重训或更细的后验校正。
-
-## 建议的下一步优化
-
-1. 调整 hard positive 采样权重或单独做小学习率微调，再比较重训前后的 `same_box_classification` 变化。
-2. 继续压制 `template_scan` 大框，重点看 `3->9`、`7->9` 和低位 `0/5`。
-3. 针对 `5->0`、`5->1` 增加更细的数字级后验校正。
-4. 保持 `evaluate_candidate_recall.py` 作为每次候选改动后的第一道验证，先确认候选召回和排名，再跑整题评估。
+调参脚本会把候选框和 CNN 分类结果缓存到 `/tmp`，清理临时文件时可直接删除 `/tmp/southplus_*` 和 `/tmp/cnn_*`。

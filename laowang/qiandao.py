@@ -1,3 +1,4 @@
+import argparse
 import html
 import json
 import re
@@ -13,10 +14,20 @@ try:
 except ImportError:
     requests = None
 
-from check import CHECK_URL, send_check_request
-from encrypt import make_check_payload_from_points
-from feich_captcha import fetch_captcha_image
-from slider_track import calc_slider_track
+try:
+    from .check import CHECK_URL, send_check_request
+    from .encrypt import make_check_payload_from_points
+    from .feich_captcha import fetch_captcha_image
+    from .slider_track import calc_slider_track
+except ImportError:
+    from check import CHECK_URL, send_check_request
+    from encrypt import make_check_payload_from_points
+    from feich_captcha import fetch_captcha_image
+    from slider_track import calc_slider_track
+try:
+    from .account_config import DEFAULT_CONFIG_PATH, AccountConfig, select_account_configs
+except ImportError:
+    from account_config import DEFAULT_CONFIG_PATH, AccountConfig, select_account_configs
 
 
 BASE_URL = "https://laowang.vip/"
@@ -357,18 +368,32 @@ def pass_captcha(context: dict[str, Any], cookies: dict[str, str], *, referer: s
     return check_text, cookies
 
 
-def run() -> None:
-    context = load_json(CONTEXT_JSON_PATH)
+def load_context_and_cookies(account: AccountConfig | None) -> tuple[dict[str, Any], dict[str, str], Path]:
+    if account is None:
+        context_path = CONTEXT_JSON_PATH
+        cookies_path = COOKIES_JSON_PATH
+    else:
+        context_path = account.context_path
+        cookies_path = account.cookies_path
+
+    context = load_json(context_path)
     cookies = {}
     cookies.update(context.get("cookies") or {})
-    cookies.update(load_json(COOKIES_JSON_PATH))
+    cookies.update(load_json(cookies_path))
+    return context, cookies, cookies_path
+
+
+def run(account: AccountConfig | None = None) -> None:
+    context, cookies, cookies_path = load_context_and_cookies(account)
+    if account is not None:
+        print(f"account: {account.name}")
 
     sign_page_url, sign_page_html, cookies = get_redirected_sign_page(context, cookies)
     try:
         qd_href = extract_qdleft_href(sign_page_html)
     except AlreadySignedError as exc:
         print(str(exc))
-        save_json(COOKIES_JSON_PATH, cookies)
+        save_json(cookies_path, cookies)
         return
     qd_url = urljoin(sign_page_url, qd_href)
     print(f"redirected sign page: {sign_page_url}")
@@ -421,13 +446,53 @@ def run() -> None:
         )
 
     cookies = merge_response_cookies(cookies, submit_response)
-    save_json(COOKIES_JSON_PATH, cookies)
+    save_json(cookies_path, cookies)
     print(f"submit status: {submit_response.status_code}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="使用已保存的账号 cookies 执行签到")
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="账号配置文件路径，默认 laowang/accounts.json",
+    )
+    parser.add_argument("--account", help="只签到指定账号名")
+    parser.add_argument("--all", action="store_true", help="签到配置中的全部账号")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    config_path = Path(args.config)
+    use_account_config = args.account or args.all or config_path.exists()
+    if not use_account_config:
+        run()
+        return 0
+
+    accounts = select_account_configs(
+        config_path=config_path,
+        account_name=args.account,
+        all_accounts=args.all,
+    )
+    failed: list[tuple[str, Exception]] = []
+    for account in accounts:
+        try:
+            run(account)
+        except Exception as exc:
+            failed.append((account.name, exc))
+            print(f"account {account.name} failed: {exc}", file=sys.stderr)
+            if not args.all:
+                break
+
+    if failed:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        run()
+        sys.exit(main())
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)

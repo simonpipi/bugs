@@ -24,22 +24,54 @@ META_PATH = BASE_DIR / "captcha_char_cnn_meta.json"
 IMAGE_SIZE = 32
 BACKGROUND_CLASS = 10
 CLASS_NAMES = [str(index) for index in range(10)] + ["bg"]
-BACKGROUND_SCORE_WEIGHT = 1.6
-SLOT_SCAN_SOURCE_PENALTY = 0.10
-TEMPLATE_SCAN_SOURCE_PENALTY = 0.30
+BACKGROUND_SCORE_WEIGHT = 1.0
+SLOT_SCAN_SOURCE_PENALTY = 0.15
+TEMPLATE_SCAN_SOURCE_PENALTY = 0.40
 TEMPLATE_LOCAL_SOURCE_PENALTY = 0.0
 TEMPLATE_MISMATCH_PENALTY = 0.05
-TEMPLATE_MATCH_BONUS = 0.10
+TEMPLATE_MATCH_BONUS = 0.15
 POSITION_FALLBACK_SOURCE_PENALTY = 0.08
 TEMPLATE_LOCAL_MIN_WIDTH_RATIO = 0.45
 TEMPLATE_LOCAL_MIN_HEIGHT_RATIO = 0.45
 TEMPLATE_LOCAL_MIN_AREA_RATIO = 0.25
 CLASSIFY_PADS = (1, 3, 5)
-GEOMETRY_DIGIT_WEIGHT = 0.6
+GEOMETRY_DIGIT_WEIGHT = 0.0
+DIGIT_GEOMETRY_SCORE_WEIGHT = 0.0
+LOW_DIGIT_TEMPLATE_SET = {0, 1, 5}
+LOW_DIGIT_TEMPLATE_QUANTILES = 6
+LOW_DIGIT_DENSE_TEMPLATE_IOU = 0.45
 ONE_MIN_WIDTH = 6
 ONE_MIN_HEIGHT = 8
 ONE_MAX_WIDTH = 22
 ONE_MAX_HEIGHT = 28
+ONE_CONFIDENCE_MIN = 0.85
+ONE_BACKGROUND_MAX = 0.25
+ONE_LOW_CONFIDENCE_PENALTY = 0.60
+SEVEN_CONFIDENCE_MIN = 0.65
+SEVEN_BACKGROUND_MAX = 0.45
+SEVEN_LOW_CONFIDENCE_PENALTY = 0.20
+POST_RULE_TOP_K = 2
+EXTENDED_POST_RULE_TOP_K = 4
+COMPONENT_ONE_POST_BONUS = 0.20
+POSITION_ONE_FIVE_POST_PENALTY = 0.20
+SLOT_SCAN_POST_PENALTY = 0.20
+POSITION_THREE_TEMPLATE_SCAN_POST_PENALTY = 0.20
+POSITION_TWO_ONE_POST_PENALTY = 0.20
+EIGHT_TEMPLATE_LOCAL_POST_PENALTY = 0.20
+EIGHT_POSITION_FALLBACK_POST_PENALTY = 0.20
+HIGH_BACKGROUND_TEMPLATE_FIVE_POST_BONUS = 0.20
+POSITION_ONE_COMPONENT_EIGHT_POST_PENALTY = 0.20
+LOW_CONFIDENCE_TEMPLATE_ZERO_MAX_PROB = 0.25
+LOW_CONFIDENCE_TEMPLATE_ZERO_POST_BONUS = 0.20
+SHORT_TEMPLATE_ZERO_MAX_HEIGHT = 12
+SHORT_TEMPLATE_ZERO_POST_BONUS = 0.20
+VERY_LOW_CONFIDENCE_TEMPLATE_ZERO_POST_BONUS = 0.20
+POSITION_ONE_TEMPLATE_SIX_POST_BONUS = 0.40
+POSITION_ONE_SLOT_SCAN_ONE_POST_PENALTY = 0.20
+POSITION_ONE_TEMPLATE_FOUR_MATCH_POST_BONUS = 0.30
+POSITION_THREE_TEMPLATE_TWO_MATCH_POST_BONUS = 0.40
+POSITION_TWO_SLOT_SCAN_ONE_EXTRA_POST_PENALTY = 0.40
+_TORCH_NUMPY_BRIDGE_AVAILABLE = None
 
 
 def import_torch():
@@ -220,6 +252,72 @@ def compute_slot_scan_templates_v2(rows):
     return templates
 
 
+def compute_slot_scan_templates_v3(rows):
+    templates = compute_slot_scan_templates_v2(rows)
+    for position in range(4):
+        position_templates = list(templates.get(str(position), []))
+        seen = {tuple(item["box"]) for item in position_templates}
+        for digit in sorted(LOW_DIGIT_TEMPLATE_SET):
+            items = sorted(
+                [
+                    row
+                    for row in rows
+                    if int(row["pos"]) == position and int(row["digit"]) == digit
+                ],
+                key=lambda row: (int(row["y"]), int(row["x"]), int(row["w"]), int(row["h"])),
+            )
+            if not items:
+                continue
+            indexes = {
+                round(index * (len(items) - 1) / max(1, LOW_DIGIT_TEMPLATE_QUANTILES - 1))
+                for index in range(LOW_DIGIT_TEMPLATE_QUANTILES)
+            }
+            for index in sorted(indexes):
+                box = box_tuple(items[index])
+                if box in seen:
+                    continue
+                seen.add(box)
+                position_templates.append(
+                    {
+                        "box": box,
+                        "digit_template": str(digit),
+                    }
+                )
+        templates[str(position)] = position_templates
+    return templates
+
+
+def compute_slot_scan_templates_v4(rows):
+    templates = compute_slot_scan_templates_v3(rows)
+    for position in range(4):
+        position_templates = list(templates.get(str(position), []))
+        seen = {tuple(item["box"]) for item in position_templates}
+        for digit in sorted(LOW_DIGIT_TEMPLATE_SET):
+            items = sorted(
+                [
+                    row
+                    for row in rows
+                    if int(row["pos"]) == position and int(row["digit"]) == digit
+                ],
+                key=lambda row: (int(row["y"]), int(row["x"]), int(row["w"]), int(row["h"])),
+            )
+            for item in items:
+                box = box_tuple(item)
+                if box in seen:
+                    continue
+                if any(box_iou(box, template["box"]) >= LOW_DIGIT_DENSE_TEMPLATE_IOU for template in position_templates):
+                    continue
+                seen.add(box)
+                position_templates.append(
+                    {
+                        "box": box,
+                        "digit_template": str(digit),
+                    }
+                )
+        templates[str(position)] = position_templates
+    return templates
+
+
 def compute_digit_box_stats(rows):
     stats = {}
     for digit in range(10):
@@ -264,7 +362,7 @@ def clamp_box(box, image_width=150, image_height=60):
     return (x, y, width, height)
 
 
-def local_foreground_template_box(image, box, pad=6):
+def local_foreground_template_box(image, box, pad=12):
     image_height, image_width = image.shape[:2]
     x, y, width, height = [int(value) for value in box]
     x0 = max(0, x - pad)
@@ -347,8 +445,17 @@ def make_square(crop, size=IMAGE_SIZE):
 
 
 def tensor_from_image(torch, image):
-    normalized = image.astype("float32") / 255.0
-    return torch.tensor(normalized.tolist(), dtype=torch.float32).unsqueeze(0)
+    global _TORCH_NUMPY_BRIDGE_AVAILABLE
+    if _TORCH_NUMPY_BRIDGE_AVAILABLE is not False:
+        try:
+            tensor = torch.from_numpy(image).to(dtype=torch.float32).div(255.0).unsqueeze(0)
+            _TORCH_NUMPY_BRIDGE_AVAILABLE = True
+            return tensor
+        except RuntimeError:
+            _TORCH_NUMPY_BRIDGE_AVAILABLE = False
+    contiguous = np.ascontiguousarray(image)
+    tensor = torch.frombuffer(bytearray(contiguous.tobytes()), dtype=torch.uint8)
+    return tensor.view(*contiguous.shape).to(dtype=torch.float32).div(255.0).unsqueeze(0)
 
 
 def generate_negative_samples(rows, samples_dir, per_file=8, seed=42):
@@ -377,6 +484,8 @@ def generate_negative_samples(rows, samples_dir, per_file=8, seed=42):
 
 
 def read_hard_negative_samples(path, rows=None):
+    if not path:
+        return []
     path = Path(path)
     if not path.exists():
         return []
@@ -411,6 +520,8 @@ def read_hard_negative_samples(path, rows=None):
 
 
 def read_hard_positive_samples(path, rows=None):
+    if not path:
+        return []
     path = Path(path)
     if not path.exists():
         return []
@@ -521,7 +632,7 @@ def train_char_cnn(
     learning_rate=1e-3,
     negative_per_file=8,
     hard_negatives_path=HARD_NEGATIVES_CSV,
-    hard_positives_path=HARD_POSITIVES_CSV,
+    hard_positives_path="",
     val_ratio=0.15,
     seed=42,
 ):
@@ -590,6 +701,8 @@ def train_char_cnn(
         "position_center_ranges": compute_position_center_ranges(rows),
         "slot_scan_templates": compute_slot_scan_templates(rows),
         "slot_scan_templates_v2": compute_slot_scan_templates_v2(rows),
+        "slot_scan_templates_v3": compute_slot_scan_templates_v3(rows),
+        "slot_scan_templates_v4": compute_slot_scan_templates_v4(rows),
         "digit_box_stats": compute_digit_box_stats(rows),
         "val_accuracy": best_accuracy,
     }
@@ -630,6 +743,12 @@ def load_char_cnn(model_path=MODEL_PATH, meta_path=META_PATH):
         if "slot_scan_templates_v2" not in meta:
             rows = rows or read_csv(CHAR_LABELS_CSV)
             meta["slot_scan_templates_v2"] = compute_slot_scan_templates_v2(rows)
+        if "slot_scan_templates_v3" not in meta:
+            rows = rows or read_csv(CHAR_LABELS_CSV)
+            meta["slot_scan_templates_v3"] = compute_slot_scan_templates_v3(rows)
+        if "slot_scan_templates_v4" not in meta:
+            rows = rows or read_csv(CHAR_LABELS_CSV)
+            meta["slot_scan_templates_v4"] = compute_slot_scan_templates_v4(rows)
         if "digit_box_stats" not in meta:
             rows = rows or read_csv(CHAR_LABELS_CSV)
             meta["digit_box_stats"] = compute_digit_box_stats(rows)
@@ -710,7 +829,12 @@ def slot_candidates_for_position(components, meta, position, image=None):
                 "distance": 0,
             }
         )
-    templates = meta.get("slot_scan_templates_v2") or meta.get("slot_scan_templates", {})
+    templates = (
+        meta.get("slot_scan_templates_v4")
+        or meta.get("slot_scan_templates_v3")
+        or meta.get("slot_scan_templates_v2")
+        or meta.get("slot_scan_templates", {})
+    )
     for template in templates.get(str(position), []):
         box = tuple(template["box"])
         candidates.append(
@@ -807,6 +931,16 @@ def choose_digit_with_geometry(probabilities, box, meta):
     return str(digit_index), probabilities[digit_index]
 
 
+def digit_geometry_score_penalty(digit, box, meta):
+    stats = meta.get("digit_box_stats") or {}
+    digit_stats = stats.get(str(digit))
+    if not digit_stats or DIGIT_GEOMETRY_SCORE_WEIGHT <= 0:
+        return 0.0
+    _, _, width, height = box
+    shape_distance = abs(math.log(max(1, width) / digit_stats["w"])) + abs(math.log(max(1, height) / digit_stats["h"]))
+    return DIGIT_GEOMETRY_SCORE_WEIGHT * shape_distance
+
+
 def box_center_x(box):
     x, _, width, _ = box
     return x + width / 2
@@ -830,6 +964,82 @@ def digit_one_shape_penalty(box):
     if height > ONE_MAX_HEIGHT:
         penalty += min(0.35, (height - ONE_MAX_HEIGHT) * 0.03)
     return penalty
+
+
+def digit_one_confidence_penalty(digit_prob, background_prob):
+    if digit_prob < ONE_CONFIDENCE_MIN or background_prob > ONE_BACKGROUND_MAX:
+        return ONE_LOW_CONFIDENCE_PENALTY
+    return 0.0
+
+
+def digit_seven_confidence_penalty(digit_prob, background_prob):
+    if digit_prob < SEVEN_CONFIDENCE_MIN or background_prob > SEVEN_BACKGROUND_MAX:
+        return SEVEN_LOW_CONFIDENCE_PENALTY
+    return 0.0
+
+
+def apply_post_scoring_rules(items):
+    ranked = sorted(items, key=lambda item: item["score"], reverse=True)
+    for item in ranked[:POST_RULE_TOP_K]:
+        if item["digit"] == "1" and item["source"] == "component":
+            item["score"] += COMPONENT_ONE_POST_BONUS
+        if item["digit"] == "5" and item["position"] == 1:
+            item["score"] -= POSITION_ONE_FIVE_POST_PENALTY
+        if item["source"] == "slot_scan":
+            item["score"] -= SLOT_SCAN_POST_PENALTY
+        if item["source"] == "template_scan" and item["position"] == 3:
+            item["score"] -= POSITION_THREE_TEMPLATE_SCAN_POST_PENALTY
+        if item["digit"] == "1" and item["position"] == 2:
+            item["score"] -= POSITION_TWO_ONE_POST_PENALTY
+        if item["digit"] == "8" and item["source"] == "template_local":
+            item["score"] -= EIGHT_TEMPLATE_LOCAL_POST_PENALTY
+        if item["digit"] == "8" and item["source"] == "position_fallback":
+            item["score"] -= EIGHT_POSITION_FALLBACK_POST_PENALTY
+        if item["digit"] == "5" and item["source"] == "template_scan" and item["background_prob"] >= 0.75:
+            item["score"] += HIGH_BACKGROUND_TEMPLATE_FIVE_POST_BONUS
+        if item["digit"] == "8" and item["source"] == "component" and item["position"] == 1:
+            item["score"] -= POSITION_ONE_COMPONENT_EIGHT_POST_PENALTY
+        if (
+            item["digit"] == "0"
+            and item["source"] == "template_scan"
+            and item["digit_prob"] <= LOW_CONFIDENCE_TEMPLATE_ZERO_MAX_PROB
+        ):
+            item["score"] += LOW_CONFIDENCE_TEMPLATE_ZERO_POST_BONUS
+        if (
+            item["digit"] == "0"
+            and item["source"] == "template_scan"
+            and item["box"][3] <= SHORT_TEMPLATE_ZERO_MAX_HEIGHT
+        ):
+            item["score"] += SHORT_TEMPLATE_ZERO_POST_BONUS
+    ranked = sorted(ranked, key=lambda item: item["score"], reverse=True)
+    for item in ranked[:EXTENDED_POST_RULE_TOP_K]:
+        if (
+            item["digit"] == "0"
+            and item["source"] == "template_scan"
+            and item["digit_prob"] <= LOW_CONFIDENCE_TEMPLATE_ZERO_MAX_PROB
+        ):
+            item["score"] += VERY_LOW_CONFIDENCE_TEMPLATE_ZERO_POST_BONUS
+        if item["digit"] == "6" and item["source"] == "template_scan" and item["position"] == 1:
+            item["score"] += POSITION_ONE_TEMPLATE_SIX_POST_BONUS
+        if item["digit"] == "1" and item["source"] == "slot_scan" and item["position"] == 1:
+            item["score"] -= POSITION_ONE_SLOT_SCAN_ONE_POST_PENALTY
+        if (
+            item["digit"] == "4"
+            and item["source"] == "template_scan"
+            and item["position"] == 1
+            and str(item.get("digit_template", "")) == "4"
+        ):
+            item["score"] += POSITION_ONE_TEMPLATE_FOUR_MATCH_POST_BONUS
+        if (
+            item["digit"] == "2"
+            and item["source"] == "template_scan"
+            and item["position"] == 3
+            and str(item.get("digit_template", "")) == "2"
+        ):
+            item["score"] += POSITION_THREE_TEMPLATE_TWO_MATCH_POST_BONUS
+        if item["digit"] == "1" and item["source"] == "slot_scan" and item["position"] == 2:
+            item["score"] -= POSITION_TWO_SLOT_SCAN_ONE_EXTRA_POST_PENALTY
+    return sorted(ranked, key=lambda item: item["score"], reverse=True)
 
 
 def score_slot_candidates(candidates, classification_cache, position, meta):
@@ -858,7 +1068,16 @@ def score_slot_candidates(candidates, classification_cache, position, meta):
                 source_penalty += TEMPLATE_MISMATCH_PENALTY
         if digit == "1":
             source_penalty += digit_one_shape_penalty(key)
-        score = digit_prob - BACKGROUND_SCORE_WEIGHT * background_prob - distance_penalty - source_penalty
+            source_penalty += digit_one_confidence_penalty(digit_prob, background_prob)
+        elif digit == "7":
+            source_penalty += digit_seven_confidence_penalty(digit_prob, background_prob)
+        score = (
+            digit_prob
+            - BACKGROUND_SCORE_WEIGHT * background_prob
+            - distance_penalty
+            - source_penalty
+            - digit_geometry_score_penalty(digit, key, meta)
+        )
         items.append(
             {
                 **candidate,
@@ -871,7 +1090,7 @@ def score_slot_candidates(candidates, classification_cache, position, meta):
             }
         )
 
-    return sorted(items, key=lambda item: item["score"], reverse=True)
+    return apply_post_scoring_rules(items)
 
 
 def select_best_sequence(candidates_by_position, max_per_position=10):

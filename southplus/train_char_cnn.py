@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--negative-per-file", type=int, default=8)
     parser.add_argument("--hard-negatives", default=str(HARD_NEGATIVES_CSV))
-    parser.add_argument("--hard-positives", default=str(HARD_POSITIVES_CSV))
+    parser.add_argument("--hard-positives", default="", help=f"默认不启用；需要时显式传入 {HARD_POSITIVES_CSV}")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()

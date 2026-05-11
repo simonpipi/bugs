@@ -147,7 +147,10 @@ def login(
 
 
 if __name__ == "__main__":
-    from main_load import REQUEST_PROXIES, get_browser_request_context
+    try:
+        from .cookies_store import REQUEST_PROXIES, get_browser_request_context
+    except ImportError:
+        from cookies_store import REQUEST_PROXIES, get_browser_request_context
 
     context = get_browser_request_context()
     response = login(

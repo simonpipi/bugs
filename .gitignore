@@ -4,6 +4,9 @@ __pycache__/
 
 node_modules/
 
+.venv/
+**/.venv/
+
 .env
 .env.*
 
@@ -11,5 +14,12 @@ node_modules/
 
 laowang/cookies.json
 laowang/context.json
+laowang/accounts.json
+laowang/accounts/
+southplus/sp_config.json
+
+rabbitmq_delay_migration/delayed-all-full.jsonl
+rabbitmq_delay_migration/delayed-all-full.tsv
+rabbitmq_delay_migration/delayed-node1.jsonl
 
 debug/*

@@ -122,6 +122,7 @@ python3 convert_delayed_tsv.py \
 ```
 
 如果是多个节点，分别转换后再合并：
+python3 convert_delayed_tsv.py --input delayed-all-full.tsv --output delayed-all-full.jsonl
 
 ```bash
 python3 convert_delayed_tsv.py --input delayed-node0.tsv --output delayed-node0.jsonl
