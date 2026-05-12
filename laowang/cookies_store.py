@@ -1,6 +1,4 @@
 import argparse
-import json
-import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,16 +8,16 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 try:
+    from .captcha_flow import pass_slider_captcha
+    from .common import format_cookie_header, save_json
     from .feich_captcha import fetch_captcha_image
-    from .slider_track import calc_slider_track
-    from .encrypt import make_check_payload_from_points
-    from .check import build_check_headers, send_check_request
+    from .headers import browser_headers, check_headers
     from .login import login
 except ImportError:
+    from captcha_flow import pass_slider_captcha
+    from common import format_cookie_header, save_json
     from feich_captcha import fetch_captcha_image
-    from slider_track import calc_slider_track
-    from encrypt import make_check_payload_from_points
-    from check import build_check_headers, send_check_request
+    from headers import browser_headers, check_headers
     from login import login
 try:
     from .account_config import DEFAULT_CONFIG_PATH, AccountConfig, select_account_configs
@@ -36,7 +34,6 @@ REQUEST_PROXIES = {
     "http": "http://127.0.0.1:7897",
     "https": "http://127.0.0.1:7897",
 }
-CHECK_RESPONSE_PATTERN = re.compile(r"^[0-9a-fA-F]{32}_ok$")
 
 JS = r"""
 (() => {
@@ -165,49 +162,15 @@ class CaptchaCheckResult:
     cookies: dict[str, str]
 
 
-def save_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def format_cookie_header(cookies: dict[str, str]) -> str:
-    return "; ".join(f"{name}={value}" for name, value in cookies.items())
-
-
-def _format_sec_ch_ua(user_agent_data: dict[str, Any] | None) -> str:
-    brands = (user_agent_data or {}).get("brands") or []
-    values = []
-    for brand in brands:
-        name = brand.get("brand")
-        version = brand.get("version")
-        if name and version:
-            values.append(f'"{name}";v="{version}"')
-    return ", ".join(values) or '"Chromium";v="147", "Google Chrome";v="147", "Not.A/Brand";v="8"'
-
-
 def build_captcha_headers(fingerprint: dict[str, Any], *, referer: str = URL) -> dict[str, str]:
-    user_agent_data = fingerprint.get("userAgentData")
-    platform = (user_agent_data or {}).get("platform") or fingerprint.get("platform") or "macOS"
-    mobile = "?1" if (user_agent_data or {}).get("mobile") else "?0"
-
-    return {
-        "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
-        "priority": "i",
-        "referer": referer,
-        "sec-ch-ua": _format_sec_ch_ua(user_agent_data),
-        "sec-ch-ua-mobile": mobile,
-        "sec-ch-ua-platform": f'"{platform}"',
-        "sec-fetch-dest": "image",
-        "sec-fetch-mode": "no-cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": fingerprint.get("userAgent", ""),
-    }
+    return browser_headers(
+        {"fingerprint": fingerprint},
+        referer=referer,
+        accept="image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        destination="image",
+        mode="no-cors",
+        priority="i",
+    )
 
 
 def get_browser_request_context(
@@ -254,46 +217,20 @@ def pass_captcha_check(
     *,
     cookies_path: Path = COOKIES_JSON_PATH,
 ) -> CaptchaCheckResult:
-    result = fetch_captcha_image(
+    result = pass_slider_captcha(
+        context=context,
         cookies=context.cookies,
-        headers=context.headers,
+        image_headers=context.headers,
+        check_headers=check_headers(context, referer=URL),
         proxies=REQUEST_PROXIES,
+        filename_prefix="tncode",
+        debug_dir=DEBUG_DIR,
     )
-    print(f"captcha image saved: {result.image_path.resolve()}")
-    print("merged cookies:", result.cookies)
     save_json(cookies_path, result.cookies)
 
-    slider_result = calc_slider_track(result.image_path, debug_dir=DEBUG_DIR)
-    print(f"move_x: {slider_result.move_x}")
-    print(f"target position: ({slider_result.target_x}, {slider_result.target_y}), score: {slider_result.score:.4f}")
-    # print(f"track points: {slider_result.points}")
-
-    payload = make_check_payload_from_points(
-        slider_result.points,
-        offset=slider_result.move_x,
-    )
-    print(f"check payload: {payload}")
-
-    check_headers = build_check_headers(context.fingerprint)
-    check_response = send_check_request(
-        cookies=result.cookies,
-        headers=check_headers,
-        payload=payload,
-        proxies=REQUEST_PROXIES,
-    )
-    print(f"check response: {check_response.text}")
-    check_text = check_response.text.strip()
-    if not CHECK_RESPONSE_PATTERN.fullmatch(check_text):
-        raise RuntimeError(f"check response format invalid: {check_response.text!r}")
-
-    cookies = dict(result.cookies)
-    if getattr(check_response, "cookies", None) is not None:
-        cookies.update(check_response.cookies.get_dict())
-    save_json(cookies_path, cookies)
-
     return CaptchaCheckResult(
-        check_text=check_text,
-        cookies=cookies,
+        check_text=result.check_text,
+        cookies=result.cookies,
     )
 
 

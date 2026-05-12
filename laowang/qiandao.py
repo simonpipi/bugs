@@ -1,13 +1,11 @@
 import argparse
 import html
-import json
-import re
 import sys
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 try:
     from curl_cffi import requests
@@ -15,15 +13,23 @@ except ImportError:
     requests = None
 
 try:
-    from .check import CHECK_URL, send_check_request
-    from .encrypt import make_check_payload_from_points
-    from .feich_captcha import fetch_captcha_image
-    from .slider_track import calc_slider_track
+    from .captcha_flow import pass_slider_captcha
+    from .common import (
+        fingerprint_value,
+        load_context_and_cookies as _load_context_and_cookies,
+        merge_response_cookies,
+        save_json,
+    )
+    from .headers import check_headers, document_headers, image_headers, submit_headers
 except ImportError:
-    from check import CHECK_URL, send_check_request
-    from encrypt import make_check_payload_from_points
-    from feich_captcha import fetch_captcha_image
-    from slider_track import calc_slider_track
+    from captcha_flow import pass_slider_captcha
+    from common import (
+        fingerprint_value,
+        load_context_and_cookies as _load_context_and_cookies,
+        merge_response_cookies,
+        save_json,
+    )
+    from headers import check_headers, document_headers, image_headers, submit_headers
 try:
     from .account_config import DEFAULT_CONFIG_PATH, AccountConfig, select_account_configs
 except ImportError:
@@ -34,7 +40,6 @@ BASE_URL = "https://laowang.vip/"
 SIGN_URL = "https://laowang.vip/sign.php"
 CONTEXT_JSON_PATH = Path(__file__).with_name("context.json")
 COOKIES_JSON_PATH = Path(__file__).with_name("cookies.json")
-CHECK_RESPONSE_PATTERN = re.compile(r"^[0-9a-fA-F]{32}_ok$")
 REQUEST_PROXIES = None
 
 
@@ -136,131 +141,6 @@ class FormParser(HTMLParser):
             self._current = None
 
 
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def save_json(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def merge_response_cookies(cookies: dict[str, str], response: Any) -> dict[str, str]:
-    merged = dict(cookies)
-    if getattr(response, "cookies", None) is not None:
-        merged.update(response.cookies.get_dict())
-    return merged
-
-
-def _format_sec_ch_ua(fingerprint: dict[str, Any]) -> str:
-    brands = ((fingerprint.get("userAgentData") or {}).get("brands") or [])
-    values = []
-    for brand in brands:
-        name = brand.get("brand")
-        version = brand.get("version")
-        if name and version:
-            values.append(f'"{name}";v="{version}"')
-    return ", ".join(values) or '"Chromium";v="147", "Google Chrome";v="147", "Not.A/Brand";v="8"'
-
-
-def fingerprint_value(fingerprint: Any) -> str:
-    if isinstance(fingerprint, str):
-        return fingerprint
-    if not isinstance(fingerprint, dict):
-        return ""
-    return str(
-        fingerprint.get("browserFpField")
-        or fingerprint.get("fingerprint")
-        or fingerprint.get("fp")
-        or ""
-    )
-
-
-def browser_headers(
-    context: dict[str, Any],
-    *,
-    referer: str,
-    accept: str,
-    destination: str,
-    mode: str,
-    site: str = "same-origin",
-    content_type: str | None = None,
-) -> dict[str, str]:
-    fingerprint = context.get("fingerprint") or {}
-    user_agent_data = fingerprint.get("userAgentData") or {}
-    platform = user_agent_data.get("platform") or fingerprint.get("platform") or "macOS"
-    mobile = "?1" if user_agent_data.get("mobile") else "?0"
-    headers = dict(context.get("headers") or {})
-    headers.update(
-        {
-            "accept": accept,
-            "accept-language": headers.get("accept-language", "zh-CN,zh;q=0.9"),
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
-            "referer": referer,
-            "sec-ch-ua": _format_sec_ch_ua(fingerprint),
-            "sec-ch-ua-mobile": mobile,
-            "sec-ch-ua-platform": f'"{platform}"',
-            "sec-fetch-dest": destination,
-            "sec-fetch-mode": mode,
-            "sec-fetch-site": site,
-            "user-agent": fingerprint.get("userAgent") or headers.get("user-agent", ""),
-        }
-    )
-    if content_type:
-        headers["content-type"] = content_type
-        parsed = urlparse(referer)
-        headers["origin"] = f"{parsed.scheme}://{parsed.netloc}"
-    else:
-        headers.pop("content-type", None)
-        headers.pop("origin", None)
-    if destination == "document":
-        headers["upgrade-insecure-requests"] = "1"
-    return headers
-
-
-def image_headers(context: dict[str, Any], *, referer: str) -> dict[str, str]:
-    return browser_headers(
-        context,
-        referer=referer,
-        accept="image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        destination="image",
-        mode="no-cors",
-    )
-
-
-def check_headers(context: dict[str, Any], *, referer: str) -> dict[str, str]:
-    return browser_headers(
-        context,
-        referer=referer,
-        accept="*/*",
-        destination="empty",
-        mode="cors",
-        content_type="application/x-www-form-urlencoded",
-    )
-
-
-def document_headers(context: dict[str, Any], *, referer: str, site: str = "same-origin") -> dict[str, str]:
-    return browser_headers(
-        context,
-        referer=referer,
-        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        destination="document",
-        mode="navigate",
-        site=site,
-    )
-
-
-def submit_headers(context: dict[str, Any], *, referer: str) -> dict[str, str]:
-    return browser_headers(
-        context,
-        referer=referer,
-        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        destination="document",
-        mode="navigate",
-        content_type="application/x-www-form-urlencoded",
-    )
-
-
 def extract_qdleft_href(page_html: str) -> str:
     parser = QdleftHrefParser()
     parser.feed(page_html)
@@ -339,48 +219,24 @@ def get_redirected_sign_page(context: dict[str, Any], cookies: dict[str, str]) -
 
 
 def pass_captcha(context: dict[str, Any], cookies: dict[str, str], *, referer: str) -> tuple[str, dict[str, str]]:
-    captcha_response = fetch_captcha_image(
+    result = pass_slider_captcha(
+        context=context,
         cookies=cookies,
-        headers=image_headers(context, referer=referer),
+        image_headers=image_headers(context, referer=referer),
+        check_headers=check_headers(context, referer=referer),
         proxies=REQUEST_PROXIES,
         filename_prefix="qiandao_tncode",
+        debug_dir=Path.cwd() / "debug",
     )
-    cookies = dict(captcha_response.cookies)
-    print(f"captcha image saved: {captcha_response.image_path.resolve()}")
-
-    slider_result = calc_slider_track(captcha_response.image_path, debug_dir=Path.cwd() / "debug")
-    print(f"move_x: {slider_result.move_x}")
-    print(f"target position: ({slider_result.target_x}, {slider_result.target_y}), score: {slider_result.score:.4f}")
-
-    payload = make_check_payload_from_points(slider_result.points, offset=slider_result.move_x)
-    check_response = send_check_request(
-        cookies=cookies,
-        headers=check_headers(context, referer=referer),
-        payload=payload,
-        proxies=REQUEST_PROXIES,
-        check_url=CHECK_URL,
-    )
-    cookies = merge_response_cookies(cookies, check_response)
-    check_text = check_response.text.strip()
-    print(f"check response: {check_text}")
-    if not CHECK_RESPONSE_PATTERN.fullmatch(check_text):
-        raise RuntimeError(f"验证码校验返回格式异常: {check_response.text!r}")
-    return check_text, cookies
+    return result.check_text, result.cookies
 
 
 def load_context_and_cookies(account: AccountConfig | None) -> tuple[dict[str, Any], dict[str, str], Path]:
-    if account is None:
-        context_path = CONTEXT_JSON_PATH
-        cookies_path = COOKIES_JSON_PATH
-    else:
-        context_path = account.context_path
-        cookies_path = account.cookies_path
-
-    context = load_json(context_path)
-    cookies = {}
-    cookies.update(context.get("cookies") or {})
-    cookies.update(load_json(cookies_path))
-    return context, cookies, cookies_path
+    return _load_context_and_cookies(
+        account,
+        default_context_path=CONTEXT_JSON_PATH,
+        default_cookies_path=COOKIES_JSON_PATH,
+    )
 
 
 def run(account: AccountConfig | None = None) -> None:
