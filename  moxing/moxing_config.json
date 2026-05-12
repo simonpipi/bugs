@@ -1,0 +1,12 @@
+{
+  "username": "pipipipipi",
+  "password": "Simon5..",
+  "loginfield": "username",
+  "password_is_md5": false,
+  "auto_login": true,
+  "questionid": "0",
+  "answer": "",
+  "cookie_file": "moxing_cookies.json",
+  "load_cookie_file": false,
+  "timeout": 20
+}
