@@ -40,7 +40,10 @@ BASE_URL = "https://laowang.vip/"
 SIGN_URL = "https://laowang.vip/sign.php"
 CONTEXT_JSON_PATH = Path(__file__).with_name("context.json")
 COOKIES_JSON_PATH = Path(__file__).with_name("cookies.json")
-REQUEST_PROXIES = None
+REQUEST_PROXIES = {
+    # "http": "http://127.0.0.1:7897",
+    # "https": "http://127.0.0.1:7897",
+}
 
 
 @dataclass(frozen=True)
@@ -314,7 +317,7 @@ def parse_args() -> argparse.Namespace:
         help="账号配置文件路径，默认 laowang/accounts.json",
     )
     parser.add_argument("--account", help="只签到指定账号名")
-    parser.add_argument("--all", action="store_true", help="签到配置中的全部账号")
+    parser.add_argument("--all", "-all", action="store_true", help="签到配置中的全部账号")
     return parser.parse_args()
 
 

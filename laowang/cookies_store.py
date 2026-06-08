@@ -34,6 +34,40 @@ REQUEST_PROXIES = {
     "http": "http://127.0.0.1:7897",
     "https": "http://127.0.0.1:7897",
 }
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/148.0.0.0 Safari/537.36"
+)
+DEFAULT_BROWSER_VIEWPORT = {"width": 1280, "height": 720}
+DEFAULT_BROWSER_SCREEN = {"width": 1280, "height": 720}
+
+STEALTH_INIT_SCRIPT = r"""
+(() => {
+  const defineGetter = (obj, prop, value) => {
+    try {
+      Object.defineProperty(obj, prop, {
+        get: () => value,
+        configurable: true
+      });
+    } catch (e) {}
+  };
+
+  defineGetter(Navigator.prototype, "webdriver", undefined);
+  defineGetter(Navigator.prototype, "languages", ["zh-CN", "zh"]);
+  defineGetter(Navigator.prototype, "language", "zh-CN");
+  defineGetter(Navigator.prototype, "platform", "MacIntel");
+  defineGetter(Navigator.prototype, "hardwareConcurrency", 6);
+  defineGetter(Navigator.prototype, "deviceMemory", 16);
+
+  if (!window.chrome) {
+    Object.defineProperty(window, "chrome", {
+      value: { runtime: {} },
+      configurable: true
+    });
+  }
+})();
+"""
 
 JS = r"""
 (() => {
@@ -162,6 +196,55 @@ class CaptchaCheckResult:
     cookies: dict[str, str]
 
 
+def _proxy_server(proxies: dict[str, str] | None) -> str | None:
+    if not proxies:
+        return None
+    return proxies.get("https") or proxies.get("http")
+
+
+def _launch_chromium(p: Any, *, headless: bool, proxies: dict[str, str] | None) -> Any:
+    launch_options: dict[str, Any] = {
+        "headless": headless,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    proxy_server = _proxy_server(proxies)
+    if proxy_server:
+        launch_options["proxy"] = {"server": proxy_server}
+
+    try:
+        return p.chromium.launch(channel="chrome", **launch_options)
+    except Exception:
+        return p.chromium.launch(**launch_options)
+
+
+def _page_preview(page: Any, *, limit: int = 300) -> str:
+    try:
+        return " ".join(page.content().split())[:limit]
+    except Exception:
+        return ""
+
+
+def _raise_if_login_form_missing(page: Any, response: Any, login_form: dict[str, Any] | None) -> None:
+    if login_form:
+        return
+
+    status = getattr(response, "status", None)
+    title = ""
+    try:
+        title = page.title()
+    except Exception:
+        pass
+
+    preview = _page_preview(page)
+    raise RuntimeError(
+        "未拿到登录表单，停止刷新 cookies。"
+        f"status={status}, url={page.url!r}, title={title!r}。"
+        "当前页面很可能仍是 Cloudflare/风控验证页；请确认代理 127.0.0.1:7897 可用，"
+        "并优先使用默认 headed 模式完成浏览器验证。"
+        f"页面预览: {preview}"
+    )
+
+
 def build_captcha_headers(fingerprint: dict[str, Any], *, referer: str = URL) -> dict[str, str]:
     return browser_headers(
         {"fingerprint": fingerprint},
@@ -177,27 +260,43 @@ def get_browser_request_context(
     *,
     url: str = URL,
     headless: bool = True,
+    proxies: dict[str, str] | None = REQUEST_PROXIES,
     timeout: int = 60000,
     form_timeout: int = 5000,
 ) -> BrowserRequestContext:
     with sync_playwright() as p:
+        browser = _launch_chromium(p, headless=headless, proxies=proxies)
         try:
-            browser = p.chromium.launch(channel="chrome", headless=headless)
-        except Exception:
-            browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(locale="zh-CN")
+            browser_context = browser.new_context(
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                user_agent=DEFAULT_BROWSER_USER_AGENT,
+                viewport=DEFAULT_BROWSER_VIEWPORT,
+                screen=DEFAULT_BROWSER_SCREEN,
+                device_scale_factor=2,
+                is_mobile=False,
+                has_touch=False,
+            )
+            browser_context.add_init_script(STEALTH_INIT_SCRIPT)
+            page = browser_context.new_page()
 
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-        try:
-            page.wait_for_selector('form[name="login"]', state="attached", timeout=form_timeout)
-        except PlaywrightTimeoutError:
-            pass
+            response = page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout, 10000))
+            except PlaywrightTimeoutError:
+                pass
+            try:
+                page.wait_for_selector('form[name="login"]', state="attached", timeout=form_timeout)
+            except PlaywrightTimeoutError:
+                pass
 
-        fingerprint = page.evaluate(JS)
-        login_form = page.evaluate(LOGIN_FORM_JS)
-        storage_state = page.context.storage_state()
-        cookies_list = storage_state.get("cookies", [])
-        browser.close()
+            fingerprint = page.evaluate(JS)
+            login_form = page.evaluate(LOGIN_FORM_JS)
+            _raise_if_login_form_missing(page, response, login_form)
+            storage_state = browser_context.storage_state()
+            cookies_list = storage_state.get("cookies", [])
+        finally:
+            browser.close()
 
     cookies = {cookie["name"]: cookie["value"] for cookie in cookies_list}
     cookie_header = format_cookie_header(cookies)
@@ -243,7 +342,7 @@ def save_context_with_cookies(path: Path, context: BrowserRequestContext, cookie
 
 def refresh_account(account: AccountConfig, *, headless: bool = True) -> None:
     print(f"account: {account.name}")
-    context = get_browser_request_context(headless=headless)
+    context = get_browser_request_context(headless=headless, proxies=REQUEST_PROXIES)
     save_context_with_cookies(account.context_path, context, context.cookies)
     save_json(account.cookies_path, context.cookies)
     print("fingerprint data:", context.fingerprint)
@@ -289,9 +388,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--account", help="只刷新指定账号名")
     parser.add_argument("--all", action="store_true", help="刷新配置中的全部账号")
-    parser.add_argument("--headless", action="store_true", help="使用无头浏览器，默认启用")
-    parser.add_argument("--headed", action="store_false", dest="headless", help="调试时显示浏览器窗口")
-    parser.set_defaults(headless=True)
+    parser.add_argument("--headless", action="store_true", help="使用无头浏览器（更容易触发风控）")
+    parser.add_argument("--headed", action="store_false", dest="headless", help="显示浏览器窗口，默认启用")
+    parser.set_defaults(headless=False)
     return parser.parse_args()
 
 

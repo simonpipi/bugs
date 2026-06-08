@@ -196,6 +196,7 @@ def apply_config(args, config):
     args.hideid = str(args.hideid or config_get(config, "login", "hideid", default="0"))
     args.cktime = str(args.cktime or config_get(config, "login", "cktime", default="31536000"))
     args.save_html = args.save_html or config_get(config, "login", "save_html", default="southplus/login_result.html")
+    args.save_cookies = args.save_cookies or config_get(config, "login", "save_cookies", default="southplus/cookies.json")
     return args
 
 
@@ -211,6 +212,34 @@ def extract_title(html):
 def print_cookie_summary(cookie_jar):
     names = [cookie.name for cookie in cookie_jar]
     print("当前 Cookie:", ", ".join(names) if names else "(空)")
+
+
+def format_cookie_header(cookie_jar):
+    return "; ".join(f"{cookie.name}={cookie.value}" for cookie in cookie_jar)
+
+
+def dump_cookies(cookie_jar, path):
+    cookies = []
+    for cookie in cookie_jar:
+        cookies.append(
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "expires": cookie.expires,
+                "secure": cookie.secure,
+                "discard": cookie.discard,
+            }
+        )
+    payload = {
+        "saved_at": int(time.time()),
+        "cookie_header": format_cookie_header(cookie_jar),
+        "cookies": cookies,
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
 
 
 def detect_login_result(status, headers, html):
@@ -282,6 +311,7 @@ def parse_args():
         help="登录 Cookie 有效期",
     )
     parser.add_argument("--save-html", help="保存登录响应 HTML")
+    parser.add_argument("--save-cookies", help="登录成功后保存 Cookie JSON 的路径")
     return parser.parse_args()
 
 
@@ -352,6 +382,8 @@ def main():
 
         if result == "success":
             print("结果: 登录成功。")
+            dump_cookies(cookie_jar, args.save_cookies)
+            print(f"Cookie 已保存: {os.path.abspath(args.save_cookies)}")
             return 0
         if result == "password_error":
             print("结果: 账号或密码错误，停止重试。")

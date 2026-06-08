@@ -18,8 +18,24 @@ laowang/accounts.json
 laowang/accounts/
 southplus/sp_config.json
 
+moxing/char_crops/*
+
 rabbitmq_delay_migration/delayed-all-full.jsonl
 rabbitmq_delay_migration/delayed-all-full.tsv
 rabbitmq_delay_migration/delayed-node1.jsonl
 
 debug/*
+
+baidu_browser_state.json
+baidu_cookie.txt
+baidu_share.py
+laowang/buy_pan_link.py
+laowang/pan_links/
+moxing/
+qiandao_tncode.webp
+southplus/captcha.jpg
+southplus/cookies.json
+southplus/download_gf_images.py
+southplus/downloads/
+southplus/login_result.html
+tncode.webp
