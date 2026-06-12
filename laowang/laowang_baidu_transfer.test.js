@@ -1,0 +1,44 @@
+const assert = require('assert');
+const api = require('./laowang_baidu_transfer.user.js');
+
+function test(name, fn) {
+  try {
+    fn();
+    console.log(`ok - ${name}`);
+  } catch (error) {
+    console.error(`not ok - ${name}`);
+    throw error;
+  }
+}
+
+test('cleanTitle removes bracketed size and netdisk suffixes', () => {
+  const input = '[自行打包] 大美女【SkylarBlue】完美臀，超模身材 [41V 74P+4.58G][百度盘]';
+  assert.strictEqual(api.cleanTitle(input), '大美女【SkylarBlue】完美臀，超模身材');
+});
+
+test('safePathSegment removes invalid path characters and truncates long titles', () => {
+  const input = 'a/b:c*d?e"f<g>h|'.repeat(20);
+  const output = api.safePathSegment(input);
+  assert(!/[\\/:*?"<>|]/.test(output));
+  assert(output.length <= 80);
+});
+
+test('buildTargetPath uses month and cleaned title', () => {
+  const output = api.buildTargetPath('[合集] 标题 [4.58G][百度盘]', new Date('2026-06-12T10:00:00Z'));
+  assert.strictEqual(output, '/老王转存/2026-06/标题/');
+});
+
+test('extractBaiduShare finds share url and code', () => {
+  const text = '链接: https://pan.baidu.com/s/1abcDEF 提取码: 8x7k 解压密码: abc';
+  const result = api.extractBaiduShare(text);
+  assert.deepStrictEqual(result, {
+    shareUrl: 'https://pan.baidu.com/s/1abcDEF',
+    extractCode: '8x7k'
+  });
+});
+
+test('isForumPage and isBaiduPage classify urls', () => {
+  assert.strictEqual(api.isForumPage('https://laowang.vip/forum.php?mod=viewthread&tid=1'), true);
+  assert.strictEqual(api.isForumPage('https://laowang.vip/thread-2821033-1-1.html'), true);
+  assert.strictEqual(api.isBaiduPage('https://pan.baidu.com/s/1abc'), true);
+});
