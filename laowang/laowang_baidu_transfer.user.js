@@ -127,7 +127,8 @@
     parseTypeInfo,
     isPreviewImage,
     createTransferTask,
-    findPendingTaskForUrl
+    findPendingTaskForUrl,
+    originalFoldCss
   };
 
   if (typeof module !== 'undefined' && module.exports) {
@@ -279,6 +280,13 @@ function bindForumPanel(root, api, info, images) {
       else root.open(task.shareUrl, '_blank');
     });
   }
+  const toggleButton = document.querySelector('#lwbt-toggle-original');
+  if (toggleButton) {
+    toggleButton.addEventListener('click', () => {
+      document.body.classList.toggle('lwbt-show-original');
+      toggleButton.textContent = document.body.classList.contains('lwbt-show-original') ? '折叠原帖' : '展开原帖';
+    });
+  }
 }
 
 async function readTasks(root, api) {
@@ -425,5 +433,15 @@ function panelCss() {
     .lwbt-thumb{height:48px;border:1px solid #d1d5db;border-radius:5px;background:#fff;overflow:hidden;padding:0;cursor:pointer}
     .lwbt-thumb img{width:100%;height:100%;object-fit:cover}
     @media(max-width:900px){.lwbt-card{grid-template-columns:1fr}.lwbt-grid{grid-template-columns:1fr 1fr}.lwbt-main{height:160px}}
+    ${originalFoldCss()}
+  `;
+}
+
+function originalFoldCss() {
+  return `
+    body:not(.lwbt-show-original) .deanbkjs,
+    body:not(.lwbt-show-original) [id^="post_"]:not(:first-of-type),
+    body:not(.lwbt-show-original) #postlistreply,
+    body:not(.lwbt-show-original) #f_pst{display:none!important}
   `;
 }

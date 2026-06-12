@@ -91,3 +91,10 @@ test('findPendingTaskForUrl matches pending baidu share task', () => {
   const task = api.findPendingTaskForUrl(tasks, 'https://pan.baidu.com/s/1abc?pwd=abcd');
   assert.strictEqual(task.shareUrl, 'https://pan.baidu.com/s/1abc');
 });
+
+test('originalFoldCss hides noisy thread areas until original is expanded', () => {
+  const css = api.originalFoldCss();
+  assert(css.includes('body:not(.lwbt-show-original)'));
+  assert(css.includes('#postlistreply'));
+  assert(css.includes('#f_pst'));
+});
