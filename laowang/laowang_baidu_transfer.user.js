@@ -94,6 +94,22 @@
     return /\/data\/attachment\/|\/forum\/|\/album\//i.test(value);
   }
 
+  function createTransferTask(input, date = new Date()) {
+    return {
+      id: `lwbt-${date.getTime()}`,
+      sourceUrl: input.sourceUrl,
+      title: cleanTitle(input.rawTitle || input.title),
+      shareUrl: input.shareUrl,
+      extractCode: input.extractCode || '',
+      password: input.password || '',
+      size: input.size || '',
+      createdAt: date.toISOString(),
+      targetPath: buildTargetPath(input.rawTitle || input.title, date),
+      status: 'pending',
+      error: ''
+    };
+  }
+
   const api = {
     TASK_KEY,
     cleanText,
@@ -104,7 +120,8 @@
     isForumPage,
     isBaiduPage,
     parseTypeInfo,
-    isPreviewImage
+    isPreviewImage,
+    createTransferTask
   };
 
   if (typeof module !== 'undefined' && module.exports) {
@@ -219,6 +236,59 @@ function bindForumPanel(root, api, info, images) {
         setStatus(document, '当前浏览器不支持自动复制，请手动复制面板信息');
       }
     });
+  }
+  const transferButton = document.querySelector('#lwbt-transfer');
+  if (transferButton) {
+    transferButton.addEventListener('click', async () => {
+      const bodyText = document.body.innerText || '';
+      if (/您需要\s*登录/.test(bodyText) || /登录后/.test(bodyText)) {
+        setStatus(document, '请先登录论坛后刷新页面');
+        return;
+      }
+      const share = api.extractBaiduShare(bodyText);
+      if (!share) {
+        setStatus(document, '未找到百度分享链接，请先确认资源已购买并展开原帖');
+        return;
+      }
+      const confirmed = root.confirm(`确认购买/保存该资源？\n\n标题: ${info.title}\n大小: ${info.size}\n目录: ${info.targetPath}`);
+      if (!confirmed) {
+        setStatus(document, '已取消');
+        return;
+      }
+      const task = api.createTransferTask({
+        sourceUrl: root.location.href,
+        rawTitle: info.rawTitle,
+        shareUrl: share.shareUrl,
+        extractCode: share.extractCode,
+        password: info.password,
+        size: info.size
+      });
+      const tasks = await readTasks(root, api);
+      tasks.push(task);
+      await writeTasks(root, api, tasks);
+      setStatus(document, '已创建百度网盘保存任务');
+      if (typeof GM_openInTab === 'function') GM_openInTab(task.shareUrl, { active: true });
+      else root.open(task.shareUrl, '_blank');
+    });
+  }
+}
+
+async function readTasks(root, api) {
+  const fallbackStorage = root.localStorage;
+  const raw = typeof GM_getValue === 'function' ? await GM_getValue(api.TASK_KEY, '[]') : fallbackStorage.getItem(api.TASK_KEY) || '[]';
+  try {
+    return JSON.parse(raw);
+  } catch (_error) {
+    return [];
+  }
+}
+
+async function writeTasks(root, api, tasks) {
+  const raw = JSON.stringify(tasks);
+  if (typeof GM_setValue === 'function') {
+    await GM_setValue(api.TASK_KEY, raw);
+  } else {
+    root.localStorage.setItem(api.TASK_KEY, raw);
   }
 }
 

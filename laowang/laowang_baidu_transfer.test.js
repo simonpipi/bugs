@@ -68,3 +68,17 @@ test('isPreviewImage rejects avatars, smileys, icons and accepts attachment imag
   assert.strictEqual(api.isPreviewImage('https://laowang.vip/static/image/common/online_member.gif'), false);
   assert.strictEqual(api.isPreviewImage('https://laowang.vip/data/attachment/forum/202606/12/demo.jpg'), true);
 });
+
+test('createTransferTask builds a serializable task', () => {
+  const task = api.createTransferTask({
+    sourceUrl: 'https://laowang.vip/thread-1-1-1.html',
+    rawTitle: '[合集] 标题 [1G][百度盘]',
+    shareUrl: 'https://pan.baidu.com/s/1abc',
+    extractCode: 'abcd',
+    password: 'pw',
+    size: '1G'
+  }, new Date('2026-06-12T10:00:00Z'));
+  assert.strictEqual(task.title, '标题');
+  assert.strictEqual(task.targetPath, '/老王转存/2026-06/标题/');
+  assert.strictEqual(task.status, 'pending');
+});
