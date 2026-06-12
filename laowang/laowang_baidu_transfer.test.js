@@ -42,3 +42,29 @@ test('isForumPage and isBaiduPage classify urls', () => {
   assert.strictEqual(api.isForumPage('https://laowang.vip/thread-2821033-1-1.html'), true);
   assert.strictEqual(api.isBaiduPage('https://pan.baidu.com/s/1abc'), true);
 });
+
+test('parseTypeInfo extracts forum resource fields', () => {
+  const text = [
+    '下载方式: 百度盘',
+    '来源: 自行打包',
+    '文件数量: 41V 74P',
+    '资源大小: 4.58G',
+    '解压密码: 上老王论坛当老王',
+    '解压软件: -'
+  ].join('\n');
+  assert.deepStrictEqual(api.parseTypeInfo(text), {
+    downloadType: '百度盘',
+    source: '自行打包',
+    fileCount: '41V 74P',
+    size: '4.58G',
+    password: '上老王论坛当老王',
+    unzipTool: '-'
+  });
+});
+
+test('isPreviewImage rejects avatars, smileys, icons and accepts attachment images', () => {
+  assert.strictEqual(api.isPreviewImage('https://laowang.vip/uc_server/data/avatar/001/a.jpg'), false);
+  assert.strictEqual(api.isPreviewImage('https://laowang.vip/static/image/smiley/tieba/tb_17.png'), false);
+  assert.strictEqual(api.isPreviewImage('https://laowang.vip/static/image/common/online_member.gif'), false);
+  assert.strictEqual(api.isPreviewImage('https://laowang.vip/data/attachment/forum/202606/12/demo.jpg'), true);
+});
