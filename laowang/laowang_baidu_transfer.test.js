@@ -82,3 +82,12 @@ test('createTransferTask builds a serializable task', () => {
   assert.strictEqual(task.targetPath, '/老王转存/2026-06/标题/');
   assert.strictEqual(task.status, 'pending');
 });
+
+test('findPendingTaskForUrl matches pending baidu share task', () => {
+  const tasks = [
+    { status: 'saved', shareUrl: 'https://pan.baidu.com/s/old' },
+    { status: 'pending', shareUrl: 'https://pan.baidu.com/s/1abc' }
+  ];
+  const task = api.findPendingTaskForUrl(tasks, 'https://pan.baidu.com/s/1abc?pwd=abcd');
+  assert.strictEqual(task.shareUrl, 'https://pan.baidu.com/s/1abc');
+});

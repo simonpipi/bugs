@@ -110,6 +110,11 @@
     };
   }
 
+  function findPendingTaskForUrl(tasks, href) {
+    const currentUrl = String(href || '');
+    return (tasks || []).find((task) => task && task.status === 'pending' && currentUrl.startsWith(task.shareUrl)) || null;
+  }
+
   const api = {
     TASK_KEY,
     cleanText,
@@ -121,7 +126,8 @@
     isBaiduPage,
     parseTypeInfo,
     isPreviewImage,
-    createTransferTask
+    createTransferTask,
+    findPendingTaskForUrl
   };
 
   if (typeof module !== 'undefined' && module.exports) {
@@ -138,7 +144,9 @@ function main(root, api) {
   if (api.isForumPage(root.location.href)) {
     injectForumPanel(root, api);
   } else if (api.isBaiduPage(root.location.href)) {
-    // Baidu controller added in later tasks.
+    runBaidu(root, api).catch((error) => {
+      console.error('[LWBT] Baidu automation failed', error);
+    });
   }
 }
 
@@ -290,6 +298,92 @@ async function writeTasks(root, api, tasks) {
   } else {
     root.localStorage.setItem(api.TASK_KEY, raw);
   }
+}
+
+function waitForSelector(document, selectors, timeoutMs = 15000) {
+  const selectorList = Array.isArray(selectors) ? selectors : [selectors];
+  return new Promise((resolve, reject) => {
+    const found = selectorList.map((selector) => document.querySelector(selector)).find(Boolean);
+    if (found) return resolve(found);
+    const observer = new MutationObserver(() => {
+      const node = selectorList.map((selector) => document.querySelector(selector)).find(Boolean);
+      if (node) {
+        observer.disconnect();
+        resolve(node);
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(() => {
+      observer.disconnect();
+      reject(new Error(`Timed out waiting for ${selectorList.join(', ')}`));
+    }, timeoutMs);
+  });
+}
+
+async function findActiveBaiduTask(root, api) {
+  const tasks = await readTasks(root, api);
+  const active = api.findPendingTaskForUrl(tasks, root.location.href);
+  return { tasks, active };
+}
+
+async function runBaidu(root, api) {
+  const document = root.document;
+  const { tasks, active } = await findActiveBaiduTask(root, api);
+  if (!active) return;
+  showBaiduToast(document, `准备保存到 ${active.targetPath}`);
+  try {
+    await fillBaiduCodeIfNeeded(root, active);
+    await saveBaiduShare(root, active);
+    active.status = 'saved';
+    active.savedAt = new Date().toISOString();
+    await writeTasks(root, api, tasks);
+    showBaiduToast(document, '保存任务已提交');
+  } catch (error) {
+    active.status = 'failed';
+    active.error = error.message;
+    await writeTasks(root, api, tasks);
+    showBaiduToast(document, `自动保存失败：${error.message}，请手动保存`);
+  }
+}
+
+async function fillBaiduCodeIfNeeded(root, task) {
+  if (!task.extractCode) return;
+  const document = root.document;
+  const input = document.querySelector('input[placeholder*="提取码"], input[placeholder*="密码"], input[type="text"]');
+  if (!input) return;
+  input.value = task.extractCode;
+  input.dispatchEvent(new root.Event('input', { bubbles: true }));
+  const button = document.querySelector('button, .g-button, .submit-btn');
+  if (button) button.click();
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+}
+
+async function saveBaiduShare(root, task) {
+  const document = root.document;
+  const saveButton = await waitForSelector(document, [
+    '[title*="保存"]',
+    'button[aria-label*="保存"]',
+    'button'
+  ], 15000);
+  saveButton.click();
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const pathHint = document.createElement('div');
+  pathHint.id = 'lwbt-baidu-path-hint';
+  pathHint.textContent = `目标目录：${task.targetPath}`;
+  pathHint.style.cssText = 'position:fixed;right:16px;top:72px;z-index:999999;background:#fff;color:#111827;border:1px solid #d1d5db;padding:10px 12px;border-radius:8px;font-size:13px;max-width:420px;';
+  document.body.appendChild(pathHint);
+  throw new Error('百度网盘目录选择接口需登录态实测后绑定，已显示目标目录供手动确认');
+}
+
+function showBaiduToast(document, message) {
+  let node = document.querySelector('#lwbt-baidu-toast');
+  if (!node) {
+    node = document.createElement('div');
+    node.id = 'lwbt-baidu-toast';
+    node.style.cssText = 'position:fixed;right:16px;top:16px;z-index:999999;background:#111827;color:#fff;padding:12px 14px;border-radius:8px;font-size:13px;max-width:360px;line-height:1.5';
+    document.body.appendChild(node);
+  }
+  node.textContent = message;
 }
 
 function escapeHtml(value) {
