@@ -1,3 +1,9 @@
+"""统一生成接近浏览器的请求头。
+
+各业务脚本根据请求类型调用 image/check/document/submit 头部，避免每个
+脚本手写 sec-fetch、UA Client Hints、origin 等容易不一致的字段。
+"""
+
 from typing import Any
 from urllib.parse import urlparse
 
@@ -6,12 +12,16 @@ DEFAULT_SEC_CH_UA = '"Chromium";v="147", "Google Chrome";v="147", "Not.A/Brand";
 
 
 def _context_get(context: Any, key: str, default: Any = None) -> Any:
+    """兼容 dict 和 dataclass/object 两种上下文读取方式。"""
+
     if isinstance(context, dict):
         return context.get(key, default)
     return getattr(context, key, default)
 
 
 def format_sec_ch_ua(data: dict[str, Any] | None) -> str:
+    """把 navigator.userAgentData.brands 转成 sec-ch-ua 请求头。"""
+
     if data and "userAgentData" in data:
         data = data.get("userAgentData") or {}
     brands = (data or {}).get("brands") or []
@@ -37,6 +47,8 @@ def browser_headers(
     include_upgrade: bool = False,
     priority: str | None = None,
 ) -> dict[str, str]:
+    """按请求场景生成基础浏览器请求头。"""
+
     fingerprint = _context_get(context, "fingerprint", {}) or {}
     user_agent_data = fingerprint.get("userAgentData") or {}
     platform = user_agent_data.get("platform") or fingerprint.get("platform") or "macOS"
@@ -66,6 +78,7 @@ def browser_headers(
     if content_type:
         headers["content-type"] = content_type
         parsed = urlparse(referer)
+        # 有请求体的同源提交需要带 origin，图片/普通文档请求则移除它。
         headers["origin"] = f"{parsed.scheme}://{parsed.netloc}"
     else:
         headers.pop("content-type", None)
@@ -84,6 +97,8 @@ def browser_headers(
 
 
 def image_headers(context: Any, *, referer: str) -> dict[str, str]:
+    """验证码图片请求头。"""
+
     return browser_headers(
         context,
         referer=referer,
@@ -94,6 +109,8 @@ def image_headers(context: Any, *, referer: str) -> dict[str, str]:
 
 
 def check_headers(context: Any, *, referer: str) -> dict[str, str]:
+    """验证码 check.php 表单提交请求头。"""
+
     return browser_headers(
         context,
         referer=referer,
@@ -106,6 +123,8 @@ def check_headers(context: Any, *, referer: str) -> dict[str, str]:
 
 
 def document_headers(context: Any, *, referer: str, site: str = "same-origin") -> dict[str, str]:
+    """普通页面跳转/打开请求头。"""
+
     return browser_headers(
         context,
         referer=referer,
@@ -124,6 +143,8 @@ def submit_headers(
     destination: str = "document",
     include_sec_fetch_user: bool = False,
 ) -> dict[str, str]:
+    """表单提交请求头，默认模拟 document/iframe 导航提交。"""
+
     return browser_headers(
         context,
         referer=referer,

@@ -1,3 +1,5 @@
+"""滑块验证码 check.php 的请求封装。"""
+
 from typing import Any
 
 try:
@@ -10,6 +12,8 @@ REFERER = "https://laowang.vip/member.php?mod=logging&action=login"
 
 
 def build_check_headers(fingerprint: dict[str, Any]) -> dict[str, str]:
+    """根据浏览器采集到的 UA Client Hints 构造验证码校验请求头。"""
+
     sec_ch_ua_parts = []
     user_agent_data = fingerprint.get("userAgentData")
     brands = (user_agent_data or {}).get("brands") or []
@@ -50,6 +54,8 @@ def send_check_request(
     check_url: str = CHECK_URL,
     timeout: int = 30,
 ) -> Any:
+    """提交验证码轨迹签名 payload，返回原始 HTTP 响应供调用方检查。"""
+
     if requests is None:
         raise RuntimeError("缺少依赖: pip install curl_cffi")
     response = requests.post(

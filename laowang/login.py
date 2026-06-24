@@ -1,3 +1,5 @@
+"""使用浏览器采集到的登录表单和验证码结果提交论坛登录。"""
+
 import base64
 from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse, urlunparse
@@ -12,12 +14,16 @@ DEFAULT_LOGIN_REFERER = "https://laowang.vip/member.php?mod=logging&action=login
 
 
 def _context_get(context: Any, key: str, default: Any = None) -> Any:
+    """兼容 dict 和 BrowserRequestContext 两种上下文。"""
+
     if isinstance(context, dict):
         return context.get(key, default)
     return getattr(context, key, default)
 
 
 def _split_action(action: str, *, base_url: str) -> tuple[str, dict[str, str]]:
+    """把 form action 拆成无 query 的 URL 和 query 参数字典。"""
+
     action_url = urljoin(base_url, action or base_url)
     parsed = urlparse(action_url)
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -26,6 +32,8 @@ def _split_action(action: str, *, base_url: str) -> tuple[str, dict[str, str]]:
 
 
 def _build_data_from_form(login_form: dict[str, Any] | None) -> dict[str, str]:
+    """从浏览器采集的登录表单字段还原提交数据。"""
+
     data: dict[str, str] = {}
     if not login_form:
         return data
@@ -40,6 +48,7 @@ def _build_data_from_form(login_form: dict[str, Any] | None) -> dict[str, str]:
 
         field_type = (field.get("type") or "").lower()
         tag = (field.get("tag") or "").lower()
+        # 浏览器不会把按钮、文件框、未勾选单选/复选项作为普通字段提交。
         if tag == "button" or field_type in {"button", "submit", "image", "reset", "file"}:
             continue
         if field_type in {"checkbox", "radio"} and not field.get("checked"):
@@ -50,6 +59,8 @@ def _build_data_from_form(login_form: dict[str, Any] | None) -> dict[str, str]:
 
 
 def _fingerprint_value(fingerprint: Any) -> str:
+    """提取登录表单需要提交的浏览器指纹字符串。"""
+
     if isinstance(fingerprint, str):
         return fingerprint
     if not isinstance(fingerprint, dict):
@@ -69,6 +80,8 @@ def _build_login_headers(
     login_url: str,
     referer: str,
 ) -> dict[str, str]:
+    """构造登录表单提交请求头。"""
+
     headers = dict(_context_get(context, "headers", {}) or {})
     parsed = urlparse(login_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -102,7 +115,8 @@ def login(
     proxies: dict[str, str] | None = None,
     timeout: int = 30,
 ) -> Any:
-    """Submit the Discuz login form using browser-captured form, headers and cookies."""
+    """提交 Discuz 登录表单，复用浏览器采集到的表单、请求头和 Cookie。"""
+
     if requests is None:
         raise RuntimeError("缺少依赖: pip install curl_cffi")
 
@@ -116,6 +130,7 @@ def login(
     data = _build_data_from_form(login_form)
 
     encoded_password = base64.b64encode(password.encode("utf-8")).decode("ascii")
+    # 站点登录接口期望 password 字段使用 base64:// 前缀包装。
     data.update(
         {
             "username": username,

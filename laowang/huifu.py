@@ -1,3 +1,9 @@
+"""使用已保存登录态自动回复论坛帖子。
+
+脚本会读取帖子页的 fastpostform，选择回复内容，先通过滑块验证码，
+再按表单 action/参数提交回复请求，并把响应中的新 Cookie 写回本地。
+"""
+
 import argparse
 import html
 import json
@@ -61,6 +67,8 @@ DEBUG_DIR = BASE_DIR.parent / "debug"
 
 
 class FastPostFormParser(HTMLParser):
+    """只解析帖子页底部 fastpostform 的轻量 HTMLParser。"""
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.in_fastpost_form = False
@@ -70,6 +78,8 @@ class FastPostFormParser(HTMLParser):
         self.fields: dict[str, str] = {}
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """进入 fastpostform 后记录 action/method 和可提交字段。"""
+
         tag = tag.lower()
         attrs_dict = {name.lower(): value or "" for name, value in attrs}
 
@@ -105,6 +115,8 @@ class FastPostFormParser(HTMLParser):
 
 
 def load_reply_pool(path: Path) -> list[str]:
+    """读取回复池；支持 JSON 数组、包含 messages 的对象或纯文本行。"""
+
     if not path.exists():
         return [DEFAULT_MESSAGE]
 
@@ -124,6 +136,8 @@ def load_reply_pool(path: Path) -> list[str]:
 
 
 def load_reply_pool_state(path: Path) -> dict[str, Any]:
+    """读取 sequential 模式下的回复池游标。"""
+
     if not path.exists():
         return {}
     try:
@@ -140,6 +154,8 @@ def select_reply_from_pool(
     pool_path: Path,
     state_path: Path,
 ) -> str:
+    """按 random/sequential 模式从回复池中取出一条内容。"""
+
     if mode == "random":
         return random.choice(messages)
     if mode != "sequential":
@@ -161,6 +177,8 @@ def choose_reply_message(
     reply_pool_state: Path,
     reply_mode: str,
 ) -> str:
+    """命令行显式 message 优先，否则从回复池选择。"""
+
     if explicit_message is not None:
         return explicit_message
     messages = load_reply_pool(reply_pool)
@@ -179,6 +197,8 @@ def browser_headers(
     content_type: str | None = None,
     destination: str = "document",
 ) -> dict[str, str]:
+    """回复场景使用的页面/表单请求头。"""
+
     return _browser_headers(
         context,
         referer=referer,
@@ -192,6 +212,8 @@ def browser_headers(
 
 
 def load_context_and_cookies(account: AccountConfig | None) -> tuple[dict[str, Any], dict[str, str], Path]:
+    """加载当前账号的 context/cookies，并返回 Cookie 回写路径。"""
+
     return _load_context_and_cookies(
         account,
         default_context_path=CONTEXT_JSON_PATH,
@@ -200,10 +222,14 @@ def load_context_and_cookies(account: AccountConfig | None) -> tuple[dict[str, A
 
 
 def thread_url(tid: str, page: int) -> str:
+    """拼接 Discuz 伪静态帖子页地址。"""
+
     return f"https://laowang.vip/thread-{tid}-{page}-1.html"
 
 
 def split_action(action: str, *, base_url: str) -> tuple[str, dict[str, str]]:
+    """把表单 action 解析为提交 URL 和已有 query 参数。"""
+
     action_url = urljoin(base_url, action or FORUM_URL)
     parsed = urlparse(action_url)
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -212,6 +238,8 @@ def split_action(action: str, *, base_url: str) -> tuple[str, dict[str, str]]:
 
 
 def extract_fastpost_form(page_html: str) -> FastPostFormParser:
+    """从帖子页 HTML 中定位快速回复表单。"""
+
     parser = FastPostFormParser()
     parser.feed(page_html)
     if not parser.fields:
@@ -220,6 +248,8 @@ def extract_fastpost_form(page_html: str) -> FastPostFormParser:
 
 
 def extract_fid(page_html: str, action_params: dict[str, str]) -> str:
+    """优先从 action 参数取 fid，失败时从页面常见位置兜底提取。"""
+
     if action_params.get("fid"):
         return action_params["fid"]
 
@@ -244,6 +274,8 @@ def build_reply_data(
     captcha_check_text: str,
     subject: str,
 ) -> dict[str, str]:
+    """组合回复表单数据，补入验证码结果和浏览器指纹。"""
+
     data = dict(fields)
     data.update(
         {
@@ -265,6 +297,8 @@ def build_reply_params(
     tid: str,
     page: int,
 ) -> dict[str, str]:
+    """构造 Discuz 快速回复接口需要的 query 参数。"""
+
     params = {
         "mod": "post",
         "action": "reply",
@@ -287,6 +321,8 @@ def fetch_thread_page(
     tid: str,
     page: int,
 ) -> tuple[str, str, dict[str, str]]:
+    """拉取帖子页 HTML，并合并页面响应带回的新 Cookie。"""
+
     if requests is None:
         raise RuntimeError("缺少依赖: pip install curl_cffi")
 
@@ -314,6 +350,8 @@ def submit_reply(
     data: dict[str, str],
     referer: str,
 ) -> tuple[Any, dict[str, str]]:
+    """提交回复表单，返回响应和更新后的 Cookie。"""
+
     if requests is None:
         raise RuntimeError("缺少依赖: pip install curl_cffi")
 
@@ -338,6 +376,8 @@ def submit_reply(
 
 
 def pass_captcha(context: dict[str, Any], cookies: dict[str, str], *, referer: str) -> tuple[str, dict[str, str]]:
+    """回复前通过一次滑块验证码。"""
+
     result = pass_slider_captcha(
         context=context,
         cookies=cookies,
@@ -359,6 +399,8 @@ def run(
     page: int = 1,
     subject: str = "  ",
 ) -> None:
+    """执行单个账号、单个帖子的回复流程。"""
+
     context, cookies, cookies_path = load_context_and_cookies(account)
     if account is not None:
         print(f"account: {account.name}")
@@ -393,6 +435,8 @@ def run(
 
 
 def parse_args() -> argparse.Namespace:
+    """解析自动回复参数。"""
+
     parser = argparse.ArgumentParser(description="使用已保存的账号登录态调用回复接口")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="账号配置文件路径")
     parser.add_argument("--account", help="只使用指定账号名")
@@ -422,6 +466,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """命令行入口；支持单账号、全部账号或默认本地 context。"""
+
     args = parse_args()
     config_path = Path(args.config)
     reply_pool = resolve_local_path(args.reply_pool)

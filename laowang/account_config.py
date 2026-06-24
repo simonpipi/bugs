@@ -1,3 +1,9 @@
+"""读取并规范化多账号配置。
+
+该模块只负责把 accounts.json 中的账号、登录态路径和凭据来源整理成
+AccountConfig，供刷新 Cookie、签到、回复、购买等脚本复用。
+"""
+
 import json
 import os
 import re
@@ -12,6 +18,8 @@ DEFAULT_DATA_DIR_NAME = "accounts"
 
 @dataclass(frozen=True)
 class AccountConfig:
+    """单个账号运行所需的静态配置。"""
+
     name: str
     username: str
     password: str
@@ -20,6 +28,8 @@ class AccountConfig:
 
 
 def safe_account_name(name: str) -> str:
+    """把账号名转换成适合用作本地目录名的安全字符串。"""
+
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
     value = value.strip("._-")
     if not value:
@@ -28,6 +38,8 @@ def safe_account_name(name: str) -> str:
 
 
 def _resolve_path(value: Any, *, base_dir: Path) -> Path:
+    """解析配置中的路径；相对路径按配置文件所在目录计算。"""
+
     path = Path(str(value)).expanduser()
     if not path.is_absolute():
         path = base_dir / path
@@ -35,6 +47,8 @@ def _resolve_path(value: Any, *, base_dir: Path) -> Path:
 
 
 def _read_secret(raw_account: dict[str, Any], key: str) -> str:
+    """读取账号敏感字段，支持直接配置或通过 *_env 指向环境变量。"""
+
     if raw_account.get(key) is not None:
         return str(raw_account.get(key) or "")
 
@@ -46,6 +60,8 @@ def _read_secret(raw_account: dict[str, Any], key: str) -> str:
 
 
 def _normalize_raw_accounts(raw_accounts: Any) -> list[tuple[str, dict[str, Any]]]:
+    """兼容对象和数组两种 accounts 写法，统一输出 (name, config)。"""
+
     if isinstance(raw_accounts, dict):
         accounts = []
         for name, raw_account in raw_accounts.items():
@@ -69,6 +85,8 @@ def _normalize_raw_accounts(raw_accounts: Any) -> list[tuple[str, dict[str, Any]
 
 
 def load_account_configs(config_path: Path = DEFAULT_CONFIG_PATH) -> tuple[list[AccountConfig], str | None]:
+    """加载账号配置文件，并补齐默认 context/cookies 存储路径。"""
+
     config_path = config_path.expanduser()
     if not config_path.is_absolute():
         config_path = Path.cwd() / config_path
@@ -88,6 +106,7 @@ def load_account_configs(config_path: Path = DEFAULT_CONFIG_PATH) -> tuple[list[
     accounts: list[AccountConfig] = []
     for name, raw_account in _normalize_raw_accounts(raw_accounts):
         safe_name = safe_account_name(name)
+        # 未显式指定路径时，每个账号独立放到 accounts/<safe_name>/ 下。
         context_path = (
             _resolve_path(raw_account["context_path"], base_dir=base_dir)
             if raw_account.get("context_path")
@@ -118,6 +137,8 @@ def select_account_configs(
     account_name: str | None = None,
     all_accounts: bool = False,
 ) -> list[AccountConfig]:
+    """按命令行参数选择一个账号，或在 --all 模式下返回全部账号。"""
+
     accounts, active_account = load_account_configs(config_path)
     if all_accounts:
         return accounts

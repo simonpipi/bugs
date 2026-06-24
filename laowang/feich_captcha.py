@@ -1,3 +1,5 @@
+"""下载滑块验证码图片并保存到本地，供 OpenCV 识别轨迹。"""
+
 from pathlib import Path
 import random
 from dataclasses import dataclass
@@ -14,6 +16,8 @@ CAPTCHA_URL = 'https://laowang.vip/captcha/tncode.php'
 
 @dataclass(frozen=True)
 class CaptchaFetchResult:
+    """验证码图片下载结果及随响应更新的 Cookie/响应头。"""
+
     image_path: Path
     cookies: dict[str, str]
     headers: dict[str, str]
@@ -22,6 +26,8 @@ class CaptchaFetchResult:
 
 
 def image_suffix_from_response(response):
+    """优先根据 Content-Type，其次根据文件头识别图片后缀。"""
+
     content_type = response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
     content_type_map = {
         'image/png': '.png',
@@ -53,6 +59,8 @@ def image_suffix_from_response(response):
 
 
 def save_image_response(response, filename_prefix='tncode'):
+    """校验图片响应并按真实格式写入本地文件。"""
+
     if response.status_code != 200:
         preview = response.text[:300] if hasattr(response, 'text') else response.content[:300]
         raise RuntimeError(
@@ -67,6 +75,8 @@ def save_image_response(response, filename_prefix='tncode'):
 
 
 def _extract_response_cookies(response) -> dict[str, str]:
+    """从验证码图片响应中提取新 Cookie。"""
+
     cookies: dict[str, str] = {}
     if getattr(response, 'cookies', None) is not None:
         cookies.update(response.cookies.get_dict())
@@ -89,6 +99,8 @@ def fetch_captcha_image(
     params: dict[str, Any] | None = None,
     timeout: int = 60,
 ) -> CaptchaFetchResult:
+    """请求验证码图片，保存文件，并返回合并后的 Cookie。"""
+
     if requests is None:
         raise RuntimeError('缺少依赖: pip install curl_cffi')
 
@@ -98,6 +110,7 @@ def fetch_captcha_image(
     if params:
         request_params.update(params)
 
+    # 随机 t 参数用于绕过图片缓存，保持与浏览器刷新验证码的行为一致。
     response = requests.get(
         captcha_url,
         params=request_params,

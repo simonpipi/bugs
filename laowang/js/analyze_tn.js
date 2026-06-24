@@ -1,8 +1,12 @@
+// 在 Node.js VM 中搭建最小浏览器环境，用于离线分析 tn_code.raw.js。
+// 主要目标是找出 generateSecurePayload、指纹填充函数和混淆解码结果，
+// 便于把前端验证码签名逻辑复现到 Python。
 const fs = require('fs');
 const vm = require('vm');
 
 const src = fs.readFileSync(__dirname + '/tn_code.raw.js', 'utf8');
 
+// 伪造 Canvas/WebGL/DOM API，满足验证码脚本的浏览器环境探测。
 const noop = () => {};
 const fakeCanvas = {
   width: 0,
@@ -126,6 +130,7 @@ for (const name of names) {
   console.log(name, typeof context[name]);
 }
 
+// 如果混淆字符串解码函数暴露出来，打印部分样本辅助人工定位关键函数。
 if (typeof context._0x0_0x21ac === 'function') {
   const decodeSamples = [
     [0x307, '\x4a\x29\x39\x43'],
@@ -147,6 +152,7 @@ if (typeof context._0x0_0x21ac === 'function') {
 }
 
 if (typeof context.generateSecurePayload === 'function') {
+  // 保存运行时函数源码，并用样例轨迹验证 payload 结构。
   fs.writeFileSync(__dirname + '/generateSecurePayload.runtime.js', context.generateSecurePayload.toString());
   vm.runInContext(`
     (function(){

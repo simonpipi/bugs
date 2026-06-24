@@ -1,3 +1,9 @@
+"""通过 Playwright 刷新老王论坛账号的浏览器上下文和 Cookie。
+
+该脚本负责启动真实浏览器、采集页面指纹和登录表单、通过滑块验证码，
+并在账号配置中写回 context.json/cookies.json，供后续协议脚本复用。
+"""
+
 import argparse
 import sys
 from dataclasses import asdict, dataclass
@@ -182,6 +188,8 @@ LOGIN_FORM_JS = r"""
 
 @dataclass(frozen=True)
 class BrowserRequestContext:
+    """从浏览器页面采集出的协议请求上下文。"""
+
     cookies: dict[str, str]
     headers: dict[str, str]
     fingerprint: dict[str, Any]
@@ -192,17 +200,23 @@ class BrowserRequestContext:
 
 @dataclass(frozen=True)
 class CaptchaCheckResult:
+    """cookies_store 对验证码结果的轻量包装。"""
+
     check_text: str
     cookies: dict[str, str]
 
 
 def _proxy_server(proxies: dict[str, str] | None) -> str | None:
+    """从 requests 风格代理配置中取出 Playwright 可用的代理地址。"""
+
     if not proxies:
         return None
     return proxies.get("https") or proxies.get("http")
 
 
 def _launch_chromium(p: Any, *, headless: bool, proxies: dict[str, str] | None) -> Any:
+    """启动 Chromium；优先使用本机 Chrome channel，失败时回退到内置浏览器。"""
+
     launch_options: dict[str, Any] = {
         "headless": headless,
         "args": ["--disable-blink-features=AutomationControlled"],
@@ -218,6 +232,8 @@ def _launch_chromium(p: Any, *, headless: bool, proxies: dict[str, str] | None) 
 
 
 def _page_preview(page: Any, *, limit: int = 300) -> str:
+    """提取当前页面的短文本，用于风控/表单缺失时报错定位。"""
+
     try:
         return " ".join(page.content().split())[:limit]
     except Exception:
@@ -225,6 +241,8 @@ def _page_preview(page: Any, *, limit: int = 300) -> str:
 
 
 def _raise_if_login_form_missing(page: Any, response: Any, login_form: dict[str, Any] | None) -> None:
+    """登录表单缺失时给出更明确的环境/风控提示。"""
+
     if login_form:
         return
 
@@ -246,6 +264,8 @@ def _raise_if_login_form_missing(page: Any, response: Any, login_form: dict[str,
 
 
 def build_captcha_headers(fingerprint: dict[str, Any], *, referer: str = URL) -> dict[str, str]:
+    """构造验证码图片请求头，尽量贴近浏览器发起的 image 请求。"""
+
     return browser_headers(
         {"fingerprint": fingerprint},
         referer=referer,
@@ -264,6 +284,8 @@ def get_browser_request_context(
     timeout: int = 60000,
     form_timeout: int = 5000,
 ) -> BrowserRequestContext:
+    """打开登录页并采集 Cookie、指纹、登录表单和 storage_state。"""
+
     with sync_playwright() as p:
         browser = _launch_chromium(p, headless=headless, proxies=proxies)
         try:
@@ -280,6 +302,7 @@ def get_browser_request_context(
             browser_context.add_init_script(STEALTH_INIT_SCRIPT)
             page = browser_context.new_page()
 
+            # 先等待 DOM，再短等 networkidle/登录表单；遇到风控页时后续会明确报错。
             response = page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             try:
                 page.wait_for_load_state("networkidle", timeout=min(timeout, 10000))
@@ -316,6 +339,8 @@ def pass_captcha_check(
     *,
     cookies_path: Path = COOKIES_JSON_PATH,
 ) -> CaptchaCheckResult:
+    """基于浏览器上下文完成一次验证码校验，并保存校验后的 Cookie。"""
+
     result = pass_slider_captcha(
         context=context,
         cookies=context.cookies,
@@ -334,6 +359,8 @@ def pass_captcha_check(
 
 
 def save_context_with_cookies(path: Path, context: BrowserRequestContext, cookies: dict[str, str]) -> None:
+    """把采集到的上下文和最新 Cookie 写入 context.json。"""
+
     context_data = asdict(context)
     context_data["cookies"] = cookies
     context_data["cookie_header"] = format_cookie_header(cookies)
@@ -341,6 +368,8 @@ def save_context_with_cookies(path: Path, context: BrowserRequestContext, cookie
 
 
 def refresh_account(account: AccountConfig, *, headless: bool = True) -> None:
+    """刷新单个账号的登录态；账号配置缺少密码时只保存未登录上下文。"""
+
     print(f"account: {account.name}")
     context = get_browser_request_context(headless=headless, proxies=REQUEST_PROXIES)
     save_context_with_cookies(account.context_path, context, context.cookies)
@@ -380,6 +409,8 @@ def refresh_account(account: AccountConfig, *, headless: bool = True) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析刷新账号登录态的命令行参数。"""
+
     parser = argparse.ArgumentParser(description="刷新老王账号的 context 和 cookies")
     parser.add_argument(
         "--config",
@@ -395,6 +426,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """命令行入口，支持单账号或全部账号刷新。"""
+
     args = parse_args()
     accounts = select_account_configs(
         config_path=Path(args.config),

@@ -1,3 +1,9 @@
+"""使用已保存的登录态执行论坛签到。
+
+流程为：打开 sign.php 并跟随入口跳转 -> 找到签到按钮链接 -> 打开验证码
+表单页 -> 通过滑块验证码 -> 提交签到表单 -> 回写最新 Cookie。
+"""
+
 import argparse
 import html
 import sys
@@ -48,16 +54,22 @@ REQUEST_PROXIES = {
 
 @dataclass(frozen=True)
 class FormInfo:
+    """页面表单的 action、method 和可提交字段。"""
+
     action: str
     method: str
     fields: list[dict[str, Any]]
 
 
 class AlreadySignedError(RuntimeError):
+    """页面显示今天已签到时抛出的业务异常。"""
+
     pass
 
 
 class QdleftHrefParser(HTMLParser):
+    """从签到页左侧区域提取真正的签到入口 href。"""
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._depth = 0
@@ -66,6 +78,8 @@ class QdleftHrefParser(HTMLParser):
         self.href: str | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """进入 qdleft 容器后记录按钮状态和第一个链接。"""
+
         attrs_dict = {name.lower(): value or "" for name, value in attrs}
         classes = attrs_dict.get("class", "").split()
         if self._depth == 0 and "qdleft" in classes:
@@ -88,6 +102,8 @@ class QdleftHrefParser(HTMLParser):
 
 
 class FormParser(HTMLParser):
+    """解析签到验证码页面中的表单字段。"""
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.forms: list[FormInfo] = []
@@ -145,6 +161,8 @@ class FormParser(HTMLParser):
 
 
 def extract_qdleft_href(page_html: str) -> str:
+    """提取签到入口；如果页面已签到则抛出 AlreadySignedError。"""
+
     parser = QdleftHrefParser()
     parser.feed(page_html)
     if not parser.href:
@@ -155,6 +173,8 @@ def extract_qdleft_href(page_html: str) -> str:
 
 
 def extract_captcha_form(page_html: str) -> FormInfo:
+    """优先选择包含验证码字段和 fingerprint 字段的表单。"""
+
     parser = FormParser()
     parser.feed(page_html)
     for form in parser.forms:
@@ -167,6 +187,8 @@ def extract_captcha_form(page_html: str) -> FormInfo:
 
 
 def build_form_data(form: FormInfo) -> dict[str, str]:
+    """按浏览器表单提交规则过滤不可提交字段。"""
+
     data: dict[str, str] = {}
     for field in form.fields:
         if field.get("disabled"):
@@ -184,6 +206,8 @@ def build_form_data(form: FormInfo) -> dict[str, str]:
 
 
 def get_redirected_sign_page(context: dict[str, Any], cookies: dict[str, str]) -> tuple[str, str, dict[str, str]]:
+    """打开 sign.php，手动处理首跳重定向并返回最终签到页。"""
+
     if requests is None:
         raise RuntimeError("缺少依赖: pip install curl_cffi")
 
@@ -222,6 +246,8 @@ def get_redirected_sign_page(context: dict[str, Any], cookies: dict[str, str]) -
 
 
 def pass_captcha(context: dict[str, Any], cookies: dict[str, str], *, referer: str) -> tuple[str, dict[str, str]]:
+    """签到提交前完成滑块验证码校验。"""
+
     result = pass_slider_captcha(
         context=context,
         cookies=cookies,
@@ -235,6 +261,8 @@ def pass_captcha(context: dict[str, Any], cookies: dict[str, str], *, referer: s
 
 
 def load_context_and_cookies(account: AccountConfig | None) -> tuple[dict[str, Any], dict[str, str], Path]:
+    """加载签到所需的浏览器上下文和 Cookie。"""
+
     return _load_context_and_cookies(
         account,
         default_context_path=CONTEXT_JSON_PATH,
@@ -243,6 +271,8 @@ def load_context_and_cookies(account: AccountConfig | None) -> tuple[dict[str, A
 
 
 def run(account: AccountConfig | None = None) -> None:
+    """执行一个账号的签到流程。"""
+
     context, cookies, cookies_path = load_context_and_cookies(account)
     if account is not None:
         print(f"account: {account.name}")
@@ -276,6 +306,7 @@ def run(account: AccountConfig | None = None) -> None:
 
     check_text, cookies = pass_captcha(context, cookies, referer=form_page_url)
     data = build_form_data(form)
+    # 服务端签到表单把验证码通过状态和浏览器指纹作为隐藏字段校验。
     data["clicaptcha-submit-info"] = check_text
     data["fingerprint"] = fingerprint_value(context.get("fingerprint"))
 
@@ -310,6 +341,8 @@ def run(account: AccountConfig | None = None) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析签到脚本参数。"""
+
     parser = argparse.ArgumentParser(description="使用已保存的账号 cookies 执行签到")
     parser.add_argument(
         "--config",
@@ -322,6 +355,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """命令行入口，支持默认 context、指定账号或全部账号。"""
+
     args = parse_args()
     config_path = Path(args.config)
     use_account_config = args.account or args.all or config_path.exists()

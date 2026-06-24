@@ -1,3 +1,5 @@
+"""使用 OpenCV 识别三段式滑块验证码，并生成拟人化水平拖拽轨迹。"""
+
 from __future__ import annotations
 
 import math
@@ -24,6 +26,8 @@ COLOR_MATCH_MAX_SQDIFF = 0.08
 
 @dataclass(frozen=True)
 class SliderResult:
+    """滑块识别结果和可直接用于前端校验的轨迹点。"""
+
     move_x: int
     start_x: int
     start_y: int
@@ -69,6 +73,7 @@ def calc_slider_track(
     print(f"image size: {w}x{h} (width x height)")
 
     top_img, slider_band, bottom_img, _band_y0 = _split_three_bands(img)
+    # 中间黑底区域里包含可拖动卡片，卡片在黑底内的 x 坐标是起始相对位置。
     piece_crop, piece_mask, piece_bbox = _extract_piece(slider_band)
 
     piece_x = piece_bbox[0]
@@ -183,6 +188,8 @@ def _next_y_offset(
     jitter_min: int,
     jitter_max: int,
 ) -> int:
+    """生成下一步 Y 轴偏移，让轨迹保持轻微抖动但不越界。"""
+
     if jitter_max <= 0:
         return 0
 
@@ -198,6 +205,8 @@ def _next_y_offset(
 
 
 def _split_three_bands(img: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """根据黑色行占比把验证码图切成上图、滑块带、下方参考图三段。"""
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     black_ratio = (gray < 25).mean(axis=1)
     rows = np.where(black_ratio > 0.68)[0]
@@ -230,6 +239,8 @@ def _split_three_bands(img: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
 
 
 def _extract_piece(slider_band: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]:
+    """从中间黑底区域中提取滑块卡片、有效纹理 mask 和卡片 bbox。"""
+
     gray = cv2.cvtColor(slider_band, cv2.COLOR_BGR2GRAY)
     non_black = (gray > 35).astype(np.uint8) * 255
 
@@ -285,6 +296,8 @@ def _match_piece_texture(
     piece_mask: np.ndarray,
     background: np.ndarray,
 ) -> tuple[int, int, float]:
+    """用边缘模板匹配在背景图中寻找卡片纹理对应位置。"""
+
     bg = background
     th, tw = piece_crop.shape[:2]
     bh, bw = bg.shape[:2]
@@ -313,6 +326,8 @@ def _match_piece_texture(
 
 
 def _make_piece_color_mask(piece_crop: np.ndarray, fallback_mask: np.ndarray) -> np.ndarray:
+    """生成颜色匹配用 mask，过滤绿色描边以减少干扰。"""
+
     gray = cv2.cvtColor(piece_crop, cv2.COLOR_BGR2GRAY)
     b, g, r = cv2.split(piece_crop)
     green = ((g > 80) & (g > r * 1.25) & (g > b * 1.25))
@@ -328,6 +343,8 @@ def _match_piece_color(
     piece_mask: np.ndarray,
     background: np.ndarray,
 ) -> tuple[int, int, float, float]:
+    """用彩色模板匹配得到候选坐标，同时计算平方差作为可靠性参考。"""
+
     color_mask = _make_piece_color_mask(piece_crop, piece_mask)
     result = cv2.matchTemplate(
         background,
@@ -466,6 +483,8 @@ def _find_target_by_background_diff(
 
 
 def _is_reliable_color_match(color_score: float, color_sqdiff: float) -> bool:
+    """判断彩色模板匹配结果是否足够可信。"""
+
     return color_score >= COLOR_MATCH_MIN_SCORE and color_sqdiff <= COLOR_MATCH_MAX_SQDIFF
 
 
@@ -478,6 +497,8 @@ def _should_prefer_color_match(
     color_sqdiff: float,
     piece_height: int,
 ) -> bool:
+    """差分结果与彩色匹配接近时，优先使用颜色匹配坐标。"""
+
     if not _is_reliable_color_match(color_score, color_sqdiff):
         return False
 
@@ -511,6 +532,8 @@ def _should_prefer_texture_match(
 
 
 def _points_to_deltas(points: list[dict[str, int]]) -> list[dict[str, int]]:
+    """把绝对轨迹点转换成相邻点 dx/dy/dt 增量。"""
+
     deltas: list[dict[str, int]] = []
     for prev, cur in zip(points, points[1:]):
         deltas.append({
@@ -532,6 +555,8 @@ def _save_debug(
     target_x: int,
     target_y: int,
 ) -> None:
+    """保存识别过程中的切图、mask 和目标框，方便人工调参。"""
+
     debug_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(debug_dir / "01_top.jpg"), top_img)
     cv2.imwrite(str(debug_dir / "02_slider_band.jpg"), slider_band)

@@ -1,3 +1,9 @@
+"""滑块验证码的完整通过流程。
+
+流程为：下载验证码图 -> 识别滑块位移和轨迹 -> 生成前端同款校验 payload
+-> 调用 check.php -> 合并服务端返回的 Cookie。
+"""
+
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +29,8 @@ HeaderBuilder = Callable[[Any], dict[str, str]]
 
 @dataclass(frozen=True)
 class CaptchaCheckResult:
+    """验证码校验成功后向业务脚本返回的结果。"""
+
     check_text: str
     cookies: dict[str, str]
     image_path: Path
@@ -44,6 +52,8 @@ def pass_slider_captcha(
     check_url: str = CHECK_URL,
     verbose: bool = True,
 ) -> CaptchaCheckResult:
+    """执行一次滑块验证码识别与校验。"""
+
     captcha_response = fetch_captcha_image(
         cookies=cookies,
         headers=image_headers,
@@ -62,6 +72,7 @@ def pass_slider_captcha(
             f"score: {slider_result.score:.4f}"
         )
 
+    # check.php 需要前端同款 track/sign/tn_r 参数，不能直接提交移动距离。
     payload = make_check_payload_from_points(slider_result.points, offset=slider_result.move_x)
     check_response = send_check_request(
         cookies=merged_cookies,
