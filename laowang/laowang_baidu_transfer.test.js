@@ -26,27 +26,134 @@ test('preview timeout constants are visible to outer download functions', () => 
   assert(scriptSource.indexOf('const PREVIEW_ATTACHMENT_READY_TIMEOUT_MS =') < bootstrapIndex);
 });
 
+test('purchase flow uses short bounded waits', () => {
+  assert(scriptSource.includes('const PURCHASE_CONFIRM_TIMEOUT_MS = 5000;'));
+  assert(scriptSource.includes('const PURCHASE_DIRECT_RESOURCE_TIMEOUT_MS = 4000;'));
+  assert(scriptSource.includes('const PURCHASE_LOOKUP_RESOURCE_TIMEOUT_MS = 5000;'));
+  assert(scriptSource.includes('const PURCHASE_LOOKUP_TARGET_TIMEOUT_MS = 6000;'));
+  assert(scriptSource.includes('const PURCHASE_OPENED_RESOURCE_TIMEOUT_MS = 5000;'));
+  assert(scriptSource.includes('const PURCHASE_LOOKUP_POLL_INTERVAL_MS = 600;'));
+  assert(!scriptSource.includes('waitForLookupTarget(root, api, 18000)'));
+  assert(!scriptSource.includes('waitForForumLookupResource(root, api, info, 12000)'));
+});
+
 test('preview downloads use original binary access instead of canvas conversion', () => {
   assert(scriptSource.includes('// @grant        GM_xmlhttpRequest'));
   assert(scriptSource.includes('// @connect      laowang.vip'));
   assert(scriptSource.includes("Accept: 'image/gif,image/jpeg,image/png,image/*,*/*;q=0.8'"));
   assert(scriptSource.includes("'Cache-Control': 'no-transform'"));
-  assert(!scriptSource.includes('drawImage('));
   assert(!scriptSource.includes('toBlob('));
+  assert(!scriptSource.includes('function readPreviewImageFile(root, api, url) {\n  const canvas'));
 });
 
 test('userscript match covers forum thread urls with query parameters', () => {
   assert(scriptSource.includes('// @match        https://laowang.vip/forum.php*'));
 });
 
+test('userscript runs on all laowang pages and exposes sign record menu', () => {
+  assert(scriptSource.includes('// @match        https://laowang.vip/*'));
+  assert(scriptSource.includes('// @grant        GM_registerMenuCommand'));
+  assert(scriptSource.includes("GM_registerMenuCommand('查看老王签到记录'"));
+  assert(scriptSource.includes("GM_registerMenuCommand('立即执行老王签到'"));
+  assert(scriptSource.includes("button.id = 'lwbt-sign-entry'"));
+});
+
+test('sign records are capped and today success skips automatic signing', () => {
+  const records = Array.from({ length: 205 }, (_value, index) => ({
+    date: '2026-06-12',
+    status: index === 0 ? 'success' : 'failed',
+    signedAt: `2026-06-12T00:${String(index % 60).padStart(2, '0')}:00.000Z`
+  }));
+  assert.strictEqual(api.SIGN_RECORD_LIMIT, 200);
+  assert.strictEqual(api.trimSignRecords(records).length, 200);
+  assert.strictEqual(api.hasSignedToday(records, new Date(2026, 5, 12, 10)), true);
+  assert.strictEqual(api.shouldSkipAutoSign({}, records, new Date(2026, 5, 12, 10)), true);
+});
+
+test('failed sign attempts are throttled without blocking later retries', () => {
+  const recent = {
+    date: '2026-06-12',
+    status: 'failed',
+    attemptedAt: new Date(2026, 5, 12, 9).toISOString()
+  };
+  assert.strictEqual(api.shouldSkipAutoSign(recent, [], new Date(2026, 5, 12, 9, 20)), true);
+  assert.strictEqual(api.shouldSkipAutoSign(recent, [], new Date(2026, 5, 12, 9, 31)), false);
+});
+
+test('extractSignEntry detects available and already-signed states', () => {
+  assert.deepStrictEqual(
+    api.extractSignEntry('<div class="qdleft"><p>已连续签到 2 天</p><a href="plugin.php?id=dsu_paulsign:sign">签到</a></div>'),
+    { alreadySigned: false, href: 'plugin.php?id=dsu_paulsign:sign' }
+  );
+  assert.deepStrictEqual(
+    api.extractSignEntry('<div class="qdleft"><a class="btnvisted">今日已签到</a></div>'),
+    { alreadySigned: true, href: '' }
+  );
+});
+
+test('parseSignFormHtml and buildSignFormData follow browser form submission rules', () => {
+  const form = api.parseSignFormHtml(`
+    <form action="sign-submit" method="post">
+      <input type="hidden" name="formhash" value="abc">
+      <input type="hidden" name="clicaptcha-submit-info" value="">
+      <input type="hidden" name="fingerprint" value="no_js">
+      <input type="checkbox" name="unchecked" value="1">
+      <input type="checkbox" name="checked" value="1" checked>
+      <input type="text" name="disabledField" value="x" disabled>
+      <button type="submit" name="submit" value="1">提交</button>
+    </form>`);
+  assert.strictEqual(form.action, 'sign-submit');
+  assert.strictEqual(form.method, 'post');
+  assert.deepStrictEqual(api.buildSignFormData(form), {
+    formhash: 'abc',
+    'clicaptcha-submit-info': '',
+    fingerprint: 'no_js',
+    checked: '1'
+  });
+});
+
+test('parseSignPoints prefers credit delta and falls back to response text', () => {
+  assert.strictEqual(api.parseSignPoints('签到成功，奖励 3 积分', {}, {}), '3');
+  assert.strictEqual(api.parseSignPoints('签到成功', { totalPoints: '82' }, { totalPoints: '87' }), '5');
+});
+
+test('parseSignStatus does not treat captcha success text as sign success', () => {
+  assert.strictEqual(api.parseSignStatus('验证成功 页面包含签到按钮'), 'failed');
+  assert.strictEqual(api.parseSignStatus('登录后可以评论，恭喜您签到成功，获得奖励'), 'success');
+  assert.strictEqual(api.parseSignStatus('恭喜您签到成功，获得奖励'), 'success');
+});
+
+test('auto sign login guard does not use generic login-after wording', () => {
+  assert(!scriptSource.includes('/请先登录|登录后|您需要登录|member\\.php\\?mod=logging/i'));
+  assert(!scriptSource.includes('/请先登录|您需要登录|登录后|未登录/.test(source)'));
+  assert(!scriptSource.includes('/请先登录|您需要登录|登录后|未登录/.test(plain)'));
+  assert.strictEqual(api.isSignLoginRequired("discuz_uid = '5882257'; disallowfloat = 'login|sendpm'; member.php?mod=logging"), false);
+  assert.strictEqual(api.isSignLoginRequired("discuz_uid = '0'; member.php?mod=logging&action=login"), true);
+  assert.strictEqual(api.isSignLoginRequired('请先登录后继续签到'), true);
+});
+
+test('captcha payload builder returns signed check.php fields', () => {
+  const payload = api.makeCaptchaCheckPayload([
+    { x: 547, y: 425, t: 0 },
+    { x: 580, y: 426, t: 600 },
+    { x: 615, y: 424, t: 1200 }
+  ], 68, new Date(2026, 5, 12, 10));
+  assert.strictEqual(payload.tn_r, '68.00');
+  assert(payload.track.length > 20);
+  assert(/^\d+$/.test(payload.ts));
+  assert(/^[0-9a-f]+$/.test(payload.sign));
+  assert.strictEqual(api.compositeFingerprintHash('abc').length, 32);
+});
+
 test('baidu tree mouse events do not pass sandbox window as event view', () => {
   assert(!scriptSource.includes("new root.MouseEvent('dblclick', { bubbles: true, cancelable: true, view: root })"));
 });
 
-test('baidu automation does not render visible status toast overlays', () => {
-  assert(!scriptSource.includes("node.id = 'lwbt-baidu-toast'"));
-  assert(!scriptSource.includes('LWBT ${message}'));
-  assert(!scriptSource.includes('right:18px'));
+test('baidu automation renders visible save result toast', () => {
+  assert(scriptSource.includes("node.id = 'lwbt-baidu-toast'"));
+  assert(scriptSource.includes('保存成功：已保存到 ${active.targetPath}'));
+  assert(scriptSource.includes("node.setAttribute('role', type === 'error' ? 'alert' : 'status')"));
+  assert(scriptSource.includes('z-index:2147483647'));
 });
 
 test('safePathSegment removes invalid path characters and truncates long titles', () => {
@@ -115,13 +222,56 @@ test('buildBaiduCreateFolderBody submits the target folder path as form data', (
   );
 });
 
-test('baidu automation uses page save flow instead of direct transfer api', () => {
-  assert(!scriptSource.includes('/share/transfer'));
-  assert(!scriptSource.includes('directTransferBaiduShare'));
+test('buildBaiduTransferUrl and body submit share resources to the target folder', () => {
+  assert.strictEqual(
+    api.buildBaiduTransferUrl({ shareId: '63038414460', from: '1100806323999' }, 'abc123', 'sek+key'),
+    '/share/transfer?shareid=63038414460&from=1100806323999&ondup=newcopy&async=1&bdstoken=abc123&sekey=sek%2Bkey&channel=chunlei&web=1&app_id=250528&clienttype=0'
+  );
+  assert.strictEqual(
+    api.buildBaiduTransferBody('/resouces/上老王论坛当老王/无/', ['770484279146616']).toString(),
+    'fsidlist=%5B770484279146616%5D&path=%2Fresouces%2F%E4%B8%8A%E8%80%81%E7%8E%8B%E8%AE%BA%E5%9D%9B%E5%BD%93%E8%80%81%E7%8E%8B%2F%E6%97%A0'
+  );
+});
+
+test('baidu direct transfer ignores zero and duplicate fs ids from page state', () => {
+  assert.deepStrictEqual(api.normalizeBaiduFsIds(['0', '737730593518241', '737730593518241', '', 'abc']), ['737730593518241']);
+  assert.strictEqual(
+    api.buildBaiduTransferBody('/resouces/上老王论坛当老王/无/', ['0', '737730593518241']).toString(),
+    'fsidlist=%5B737730593518241%5D&path=%2Fresouces%2F%E4%B8%8A%E8%80%81%E7%8E%8B%E8%AE%BA%E5%9D%9B%E5%BD%93%E8%80%81%E7%8E%8B%2F%E6%97%A0'
+  );
+});
+
+test('baidu path dialog only creates folders when api did not confirm the target path', () => {
+  assert(scriptSource.includes('const targetPathReady = await ensureBaiduTargetPath(root, root.LWBT, task.targetPath);'));
+  assert(scriptSource.includes('if (targetPathReady && await transferBaiduShareToTargetPath(root, root.LWBT, task.targetPath)) {'));
+  assert(scriptSource.includes('await chooseBaiduSavePath(root, task.targetPath, { allowCreate: !targetPathReady });'));
+  const blockedCreate = scriptSource.indexOf('if (!allowCreate) {');
+  const createButton = scriptSource.indexOf('const createButton = findButtonByText(dialog, /^新建文件夹$/);');
+  assert(blockedCreate > -1);
+  assert(createButton > -1);
+  assert(blockedCreate < createButton);
+});
+
+test('baidu path dialog can use current and recent target path text', () => {
+  assert(scriptSource.includes("'.save-path, .bottom-save-path, .bottom_save_path, [class*=\"save-path\"]'"));
+  assert(scriptSource.includes("if (node.closest && node.closest('.dialog-fileTreeDialog')) return false;"));
+  assert(scriptSource.includes('await confirmBaiduPathDialogIfOpen(root);'));
+  assert(scriptSource.includes('closeBaiduPathDialog(root);'));
+  assert(scriptSource.includes("/最近保存路径/.test(node.textContent || '') && baiduPathTextMatches(node.textContent || '', targetPath)"));
+  assert(scriptSource.includes('function findBaiduRecentPathClickTarget(node)'));
+  assert(scriptSource.includes('function clickBaiduRecentPath(root, node)'));
+  assert(scriptSource.includes('if (isBaiduRecentPathChecked(node)) return;'));
+  assert(scriptSource.includes("current.startsWith(`${expected} `)"));
+});
+
+test('baidu automation prefers direct transfer and keeps page save flow as fallback', () => {
+  assert(scriptSource.includes("api.buildBaiduTransferUrl(context, token, readBaiduSeKey(root))"));
+  assert(scriptSource.includes("api.buildBaiduTransferBody(targetPath, context.fsIds).toString()"));
+  assert(scriptSource.includes('await chooseBaiduSavePath(root, task.targetPath'));
 });
 
 test('extractBaiduShareContextFromText reads transfer parameters from page data', () => {
-  const text = 'shareid:"63038414460", share_uk:"1100806323999", fs_id:770484279146616';
+  const text = 'shareid:"63038414460", share_uk:"1100806323999", fs_id:0, fs_id:770484279146616, fsid:770484279146616';
   assert.deepStrictEqual(api.extractBaiduShareContextFromText(text), {
     shareId: '63038414460',
     from: '1100806323999',

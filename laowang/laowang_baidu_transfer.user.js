@@ -1,14 +1,16 @@
 // ==UserScript==
 // @name         老王论坛百度网盘转存助手
 // @namespace    https://laowang.vip/
-// @version      0.1.53
+// @version      0.1.61
 // @description  美化老王论坛资源帖，购买确认后按网盘类型打开或保存资源
+// @match        https://laowang.vip/*
 // @match        https://laowang.vip/forum.php*
 // @match        https://laowang.vip/thread-*
 // @match        https://pan.baidu.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -19,12 +21,27 @@
 const PREVIEW_IMAGE_TIMEOUT_MS = 20000;
 const PREVIEW_ATTACHMENT_READY_TIMEOUT_MS = 180000;
 const HOVER_PREVIEW_DELAY_MS = 150;
+const PURCHASE_CONFIRM_TIMEOUT_MS = 5000;
+const PURCHASE_DIRECT_RESOURCE_TIMEOUT_MS = 4000;
+const PURCHASE_LOOKUP_RESOURCE_TIMEOUT_MS = 5000;
+const PURCHASE_LOOKUP_TARGET_TIMEOUT_MS = 6000;
+const PURCHASE_OPENED_RESOURCE_TIMEOUT_MS = 5000;
+const PURCHASE_LOOKUP_POLL_INTERVAL_MS = 600;
+const AUTO_SIGN_LOCK_MS = 120000;
+const AUTO_SIGN_RETRY_INTERVAL_MS = 1800000;
 
 (function bootstrap(root) {
   'use strict';
 
   const TASK_KEY = 'lwbt:tasks';
-  const VERSION = '0.1.53';
+  const SIGN_RECORDS_KEY = 'lwbt:sign:records';
+  const SIGN_STATE_KEY = 'lwbt:sign:state';
+  const SIGN_RECORD_LIMIT = 200;
+  const SIGN_URL = 'https://laowang.vip/sign.php';
+  const CAPTCHA_CHECK_URL = 'https://laowang.vip/captcha/check.php';
+  const CAPTCHA_IMAGE_URL = 'https://laowang.vip/captcha/tncode.php';
+  const CAPTCHA_SECRET = 'GWDiugh398huiw0ioOYGd0934hew';
+  const VERSION = '0.1.61';
   const DEFAULT_UNZIP_PASSWORD = '上老王论坛当老王';
   const BAIDU_SAVE_ROOT = 'resouces';
   const SKIP_FORUM_NAMES = ['高价悬赏', '悬赏求助'];
@@ -122,6 +139,37 @@ const HOVER_PREVIEW_DELAY_MS = 150;
     return body;
   }
 
+  function buildBaiduTransferUrl(context, token, sekey = '') {
+    const params = {
+      shareid: context && context.shareId,
+      from: context && context.from,
+      ondup: 'newcopy',
+      async: '1',
+      bdstoken: token
+    };
+    if (sekey) params.sekey = sekey;
+    return buildBaiduApiUrl('/share/transfer', params);
+  }
+
+  function buildBaiduTransferBody(targetPath, fsIds) {
+    const body = new URLSearchParams();
+    body.set('fsidlist', `[${normalizeBaiduFsIds(fsIds).join(',')}]`);
+    body.set('path', normalizeBaiduApiPath(targetPath));
+    return body;
+  }
+
+  function normalizeBaiduFsIds(fsIds) {
+    const seen = new Set();
+    return (fsIds || [])
+      .map((value) => String(value || '').trim())
+      .filter((value) => /^\d+$/.test(value) && value !== '0')
+      .filter((value) => {
+        if (seen.has(value)) return false;
+        seen.add(value);
+        return true;
+      });
+  }
+
   function extractBaiduShareContextFromText(text) {
     const source = String(text || '');
     const shareMatch = source.match(/(?:shareid|share_id)["']?\s*[:=]\s*["']?(\d+)/i);
@@ -130,7 +178,7 @@ const HOVER_PREVIEW_DELAY_MS = 150;
     const fsPattern = /(?:fs_id|fsid)["']?\s*[:=]\s*["']?(\d+)/ig;
     let fsMatch;
     while ((fsMatch = fsPattern.exec(source))) {
-      if (!fsIds.includes(fsMatch[1])) fsIds.push(fsMatch[1]);
+      if (fsMatch[1] !== '0' && !fsIds.includes(fsMatch[1])) fsIds.push(fsMatch[1]);
     }
     if (!shareMatch || !fromMatch || !fsIds.length) return null;
     return {
@@ -318,6 +366,14 @@ const HOVER_PREVIEW_DELAY_MS = 150;
       || /您需要\s*登录\s*才可以(?:下载|查看)/.test(source);
   }
 
+  function isSignLoginRequired(text) {
+    const source = String(text || '');
+    const uid = source.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i);
+    if (uid) return uid[1] === '0';
+    const readable = cleanText(stripHtml(source.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')));
+    return /请先登录|您需要登录|未登录|您还没有登录|需要先登录/.test(readable);
+  }
+
   function isForumPage(url) {
     return /^https:\/\/laowang\.vip\/(?:forum\.php\?mod=viewthread|thread-)/.test(String(url || ''));
   }
@@ -397,6 +453,281 @@ const HOVER_PREVIEW_DELAY_MS = 150;
       balanceCurrency: softMatch ? '软妹币' : '',
       totalPoints: totalMatch ? totalMatch[1] : ''
     };
+  }
+
+  function isLaowangPage(url) {
+    try {
+      return new URL(String(url || '')).hostname === 'laowang.vip';
+    } catch (_error) {
+      return /^https:\/\/laowang\.vip\//.test(String(url || ''));
+    }
+  }
+
+  function signDateKey(date = new Date()) {
+    const value = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
+    return `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}`;
+  }
+
+  function trimSignRecords(records, limit = SIGN_RECORD_LIMIT) {
+    return (Array.isArray(records) ? records : [])
+      .filter((record) => record && typeof record === 'object')
+      .slice(0, Math.max(0, Number(limit) || 0));
+  }
+
+  function hasSignedToday(records, date = new Date()) {
+    const today = signDateKey(date);
+    return trimSignRecords(records).some((record) => {
+      const status = String(record.status || '');
+      return record.date === today && (status === 'success' || status === 'already');
+    });
+  }
+
+  function shouldSkipAutoSign(state, records, date = new Date()) {
+    const today = signDateKey(date);
+    const now = date instanceof Date && !Number.isNaN(date.getTime()) ? date.getTime() : Date.now();
+    if (hasSignedToday(records, date)) return true;
+    if (!state || state.date !== today) return false;
+    if (state.status === 'success' || state.status === 'already') return true;
+    const attemptedAt = Date.parse(state.attemptedAt || '');
+    if (!Number.isFinite(attemptedAt)) return false;
+    if (state.status === 'running') return now - attemptedAt < AUTO_SIGN_LOCK_MS;
+    return now - attemptedAt < AUTO_SIGN_RETRY_INTERVAL_MS;
+  }
+
+  function signStatusLabel(status) {
+    if (status === 'success') return '成功';
+    if (status === 'already') return '已签到';
+    if (status === 'running') return '进行中';
+    return '失败';
+  }
+
+  function extractSignEntry(html) {
+    const source = String(html || '');
+    const qdleftMatch = source.match(/<div\b[^>]*class=["'][^"']*\bqdleft\b[^"']*["'][^>]*>[\s\S]*?(?=<div\b[^>]*class=["'][^"']*\b(?:qdright|bm|wp)\b|<\/body>|$)/i);
+    const scope = qdleftMatch ? qdleftMatch[0] : source;
+    if (/\bbtnvisted\b|今日已签到|今天已签到|已经签到|您已签到|签到成功/.test(scope)) {
+      return { alreadySigned: true, href: '' };
+    }
+    const hrefMatch = scope.match(/<a\b[^>]*href=["']([^"']+)["'][^>]*>/i);
+    if (hrefMatch) return { alreadySigned: false, href: decodeHtmlAttribute(hrefMatch[1]) };
+    if (/\bbtnvisted\b|今日已签到|今天已签到|已经签到|您已签到|签到成功/.test(source)) {
+      return { alreadySigned: true, href: '' };
+    }
+    return { alreadySigned: false, href: '' };
+  }
+
+  function parseSignFormHtml(html) {
+    const forms = String(html || '').match(/<form\b[\s\S]*?<\/form>/gi) || [];
+    const parsed = forms.map((formHtml) => {
+      const fields = [];
+      formHtml.replace(/<(input|button)\b[^>]*>/gi, (fieldHtml, tagName) => {
+        const tag = String(tagName || '').toLowerCase();
+        fields.push({
+          tag,
+          type: (readHtmlAttribute(fieldHtml, 'type') || (tag === 'button' ? 'submit' : 'text')).toLowerCase(),
+          name: readHtmlAttribute(fieldHtml, 'name'),
+          value: readHtmlAttribute(fieldHtml, 'value'),
+          disabled: /\bdisabled(?:\s|=|>|$)/i.test(fieldHtml),
+          checked: /\bchecked(?:\s|=|>|$)/i.test(fieldHtml)
+        });
+        return fieldHtml;
+      });
+      return {
+        action: readHtmlAttribute(formHtml, 'action'),
+        method: (readHtmlAttribute(formHtml, 'method') || 'get').toLowerCase(),
+        fields
+      };
+    });
+    return parsed.find((form) => form.fields.some((field) => field.name === 'clicaptcha-submit-info') && form.fields.some((field) => field.name === 'fingerprint'))
+      || parsed[0]
+      || null;
+  }
+
+  function buildSignFormData(form) {
+    const data = {};
+    if (!form || !Array.isArray(form.fields)) return data;
+    form.fields.forEach((field) => {
+      if (!field || field.disabled || !field.name) return;
+      const type = String(field.type || '').toLowerCase();
+      if (field.tag === 'button' || ['button', 'submit', 'image', 'reset', 'file'].includes(type)) return;
+      if ((type === 'checkbox' || type === 'radio') && !field.checked) return;
+      data[field.name] = String(field.value || '');
+    });
+    return data;
+  }
+
+  function parseSignStatus(text) {
+    const source = cleanText(stripHtml(text));
+    if (/请先登录|您需要登录|未登录/.test(source)) return 'failed';
+    if (/今日已签到|今天已签到|已经签到|您已签到|btnvisted/.test(source)) return 'already';
+    if (/签到成功|打卡成功|成功签到|恭喜[^。；，,.]{0,30}(?:签到|获得|奖励)/.test(source)) return 'success';
+    return 'failed';
+  }
+
+  function parseSignPoints(text, beforeCredit, afterCredit) {
+    const before = Number(beforeCredit && beforeCredit.totalPoints);
+    const after = Number(afterCredit && afterCredit.totalPoints);
+    if (Number.isFinite(before) && Number.isFinite(after) && after >= before) {
+      const delta = after - before;
+      if (delta > 0) return String(delta);
+    }
+    const source = cleanText(stripHtml(text));
+    const direct = source.match(/(?:获得|奖励|增加|得到)[^0-9+-]{0,12}([+-]?\d+(?:\.\d+)?)\s*(?:积分|金币|软妹币)?/)
+      || source.match(/([+-]?\d+(?:\.\d+)?)\s*(?:积分|金币|软妹币)[^。；，,.]{0,16}(?:奖励|获得|增加|签到)/);
+    return direct ? direct[1].replace(/^\+/, '') : '';
+  }
+
+  function computeBrowserFingerprint(root) {
+    const view = root || (typeof window !== 'undefined' ? window : globalThis);
+    const nav = view.navigator || {};
+    const screenInfo = view.screen || {};
+    const languages = nav.languages && nav.languages.length ? nav.languages.join(',') : (nav.language || nav.userLanguage || '');
+    const source = [
+      nav.userAgent || '',
+      languages,
+      `${screenInfo.width || ''}x${screenInfo.height || ''}x${screenInfo.colorDepth || ''}`,
+      new Date().getTimezoneOffset(),
+      nav.platform || '',
+      nav.hardwareConcurrency || '',
+      nav.deviceMemory || '',
+      canvasFingerprint(view),
+      webglRenderer(view)
+    ].join('||');
+    return compositeFingerprintHash(source);
+  }
+
+  function canvasFingerprint(root) {
+    try {
+      const canvas = root.document.createElement('canvas');
+      canvas.width = 280;
+      canvas.height = 60;
+      const context = canvas.getContext('2d');
+      if (!context) return 'nc';
+      context.fillStyle = 'rgba(100,200,50,0.8)';
+      context.textBaseline = 'alphabetic';
+      context.fillRect(20, 12, 80, 20);
+      context.fillStyle = '#069';
+      context.font = '14px Arial,sans-serif';
+      context.fillText('Lw老王_fp😀', 12, 35);
+      context.fillStyle = '#f0a';
+      context.font = '11px Georgia';
+      context.fillText('hfsdn', 100, 22);
+      return canvas.toDataURL().slice(-32);
+    } catch (_error) {
+      return 'ce';
+    }
+  }
+
+  function webglRenderer(root) {
+    try {
+      const canvas = root.document.createElement('canvas');
+      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) return '';
+      const debug = gl.getExtension('WEBGL_debug_renderer_info');
+      if (debug) return gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) || '';
+      return gl.getParameter(gl.RENDERER) || '';
+    } catch (_error) {
+      return '';
+    }
+  }
+
+  function compositeFingerprintHash(source) {
+    const text = String(source || '');
+    const first = paddedFnv1a32(text);
+    const mid = text.length >> 1;
+    const second = paddedFnv1a32(first + text.slice(0, mid));
+    const third = paddedFnv1a32(second + text.slice(mid));
+    const fourth = paddedFnv1a32(third + String(text.length));
+    return `${first}${second}${third}${fourth}`;
+  }
+
+  function paddedFnv1a32(text) {
+    let hash = 0x811c9dc5;
+    const value = String(text || '');
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+  }
+
+  function makeCaptchaCheckPayload(points, offset, date = new Date()) {
+    const trackInfo = buildCaptchaTrackInfo(points);
+    const rawJson = JSON.stringify(trackInfo);
+    const ts = String(date.getTime());
+    const tnR = `${Number(offset || 0).toFixed(2)}`;
+    return {
+      tn_r: tnR,
+      track: xorTrackBase64(rawJson, CAPTCHA_SECRET),
+      ts,
+      sign: fnv1a32(rawJson + ts + tnR + CAPTCHA_SECRET)
+    };
+  }
+
+  function buildCaptchaTrackInfo(points) {
+    const normalized = (points || []).map((point) => ({
+      x: Number(point && point.x) || 0,
+      y: Number(point && point.y) || 0,
+      t: Number(point && point.t) || 0
+    }));
+    if (normalized.length <= 2) return { valid: false };
+    const speeds = [];
+    const directions = [];
+    let totalDist = 0;
+    for (let index = 1; index < normalized.length; index += 1) {
+      const prev = normalized[index - 1];
+      const current = normalized[index];
+      const dx = current.x - prev.x;
+      const dy = current.y - prev.y;
+      const dt = current.t - prev.t;
+      if (dt <= 0) continue;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      totalDist += dist;
+      speeds.push(dist / dt);
+      directions.push(Math.atan2(dy, dx));
+    }
+    const avgSpeed = speeds.length ? speeds.reduce((sum, value) => sum + value, 0) / speeds.length : 0;
+    const maxSpeed = speeds.length ? Math.max(...speeds) : 0;
+    const minSpeed = speeds.length ? Math.min(...speeds) : 0;
+    const speedVar = speeds.length ? speeds.reduce((sum, value) => sum + Math.pow(value - avgSpeed, 2), 0) / speeds.length : 0;
+    let dirChanges = 0;
+    for (let index = 1; index < directions.length; index += 1) {
+      if (Math.abs(directions[index] - directions[index - 1]) > Math.PI / 3) dirChanges += 1;
+    }
+    return {
+      valid: true,
+      points: normalized.length,
+      totalTime: normalized[normalized.length - 1].t,
+      totalDist,
+      avgSpeed,
+      maxSpeed,
+      minSpeed,
+      speedVar,
+      dirChanges,
+      finalX: normalized[normalized.length - 1].x - normalized[0].x
+    };
+  }
+
+  function xorTrackBase64(rawJson, secret) {
+    const encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+    if (!encoder || typeof btoa !== 'function') return '';
+    const textBytes = encoder.encode(String(rawJson || ''));
+    const secretBytes = encoder.encode(String(secret || ''));
+    let binary = '';
+    for (let index = 0; index < textBytes.length; index += 1) {
+      binary += String.fromCharCode(textBytes[index] ^ secretBytes[index % secretBytes.length]);
+    }
+    return btoa(binary);
+  }
+
+  function fnv1a32(text) {
+    let hash = 0x811c9dc5;
+    const value = String(text || '');
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = (hash + ((hash << 1) >>> 0) + ((hash << 4) >>> 0) + ((hash << 7) >>> 0) + ((hash << 8) >>> 0) + ((hash << 24) >>> 0)) >>> 0;
+    }
+    return hash.toString(16);
   }
 
   function stripHtml(value) {
@@ -899,6 +1230,12 @@ const HOVER_PREVIEW_DELAY_MS = 150;
 
   const api = {
     TASK_KEY,
+    SIGN_RECORDS_KEY,
+    SIGN_STATE_KEY,
+    SIGN_RECORD_LIMIT,
+    SIGN_URL,
+    CAPTCHA_CHECK_URL,
+    CAPTCHA_IMAGE_URL,
     VERSION,
     SKIP_FORUM_NAMES,
     cleanText,
@@ -909,8 +1246,11 @@ const HOVER_PREVIEW_DELAY_MS = 150;
     normalizeTargetPath,
     baiduPathSteps,
     baiduPathEntries,
+    normalizeBaiduFsIds,
     buildBaiduApiUrl,
     buildBaiduCreateFolderBody,
+    buildBaiduTransferUrl,
+    buildBaiduTransferBody,
     extractBaiduShareContextFromText,
     extractBaiduTokenFromText,
     extractBaiduShare,
@@ -928,6 +1268,7 @@ const HOVER_PREVIEW_DELAY_MS = 150;
     isPurchaseLink,
     isResourceLookupLink,
     isLoginRequired,
+    isSignLoginRequired,
     isForumPage,
     isForumFirstPage,
     readForumNames,
@@ -937,6 +1278,24 @@ const HOVER_PREVIEW_DELAY_MS = 150;
     parseTypeInfo,
     parsePurchaseInfo,
     parseCreditInfo,
+    isLaowangPage,
+    signDateKey,
+    trimSignRecords,
+    hasSignedToday,
+    shouldSkipAutoSign,
+    signStatusLabel,
+    extractSignEntry,
+    parseSignFormHtml,
+    buildSignFormData,
+    parseSignStatus,
+    parseSignPoints,
+    computeBrowserFingerprint,
+    compositeFingerprintHash,
+    paddedFnv1a32,
+    makeCaptchaCheckPayload,
+    buildCaptchaTrackInfo,
+    xorTrackBase64,
+    fnv1a32,
     buildPurchaseConfirmText,
     isPreviewImage,
     readPreviewImageUrl,
@@ -988,6 +1347,13 @@ const HOVER_PREVIEW_DELAY_MS = 150;
 
 function main(root, api) {
   if (!root || !root.location || !root.document) return;
+  registerSignRecordsMenu(root, api);
+  if (api.isLaowangPage(root.location.href)) {
+    injectSignRecordsEntry(root, api);
+    maybeAutoSign(root, api).catch((error) => {
+      console.warn('[LWBT] Auto sign failed', error);
+    });
+  }
   if (api.isForumPage(root.location.href) && api.isForumFirstPage(root.location.href) && !api.shouldSkipForumPanel(root.document)) {
     injectForumPanel(root, api);
   } else if (api.isBaiduPage(root.location.href)) {
@@ -995,6 +1361,666 @@ function main(root, api) {
       console.error('[LWBT] Baidu automation failed', error);
     });
   }
+}
+
+function registerSignRecordsMenu(root, api) {
+  if (root.__lwbtSignMenuRegistered) return;
+  root.__lwbtSignMenuRegistered = true;
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('查看老王签到记录', () => {
+      showSignRecordsDialog(root, api).catch((error) => {
+        console.warn('[LWBT] Failed to show sign records', error);
+      });
+    });
+    GM_registerMenuCommand('立即执行老王签到', () => {
+      maybeAutoSign(root, api, { force: true, quiet: false }).catch((error) => {
+        console.warn('[LWBT] Manual sign failed', error);
+      });
+    });
+  }
+}
+
+function injectSignRecordsEntry(root, api) {
+  const document = root.document;
+  if (!document || !document.body || document.querySelector('#lwbt-sign-entry')) return;
+  const button = document.createElement('button');
+  button.id = 'lwbt-sign-entry';
+  button.type = 'button';
+  button.textContent = '签到记录';
+  button.style.cssText = [
+    'position:fixed',
+    'right:24px',
+    'bottom:24px',
+    'z-index:2147483646',
+    'border:0',
+    'border-radius:999px',
+    'background:#111827',
+    'color:#fff',
+    'box-shadow:0 10px 28px rgba(15,23,42,.22)',
+    'font:700 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+    'padding:10px 13px',
+    'cursor:pointer'
+  ].join(';');
+  button.addEventListener('click', () => {
+    showSignRecordsDialog(root, api).catch((error) => {
+      console.warn('[LWBT] Failed to show sign records', error);
+    });
+  });
+  document.body.appendChild(button);
+}
+
+async function maybeAutoSign(root, api, options = {}) {
+  if (!api || !api.isLaowangPage(root.location && root.location.href) || !root.fetch) return null;
+  const records = await readSignRecords(root, api);
+  const state = await readSignState(root, api);
+  if (!options.force && api.shouldSkipAutoSign(state, records, new Date())) return null;
+
+  const startedAt = new Date();
+  await writeSignState(root, api, {
+    date: api.signDateKey(startedAt),
+    status: 'running',
+    attemptedAt: startedAt.toISOString()
+  });
+
+  let result;
+  try {
+    result = await performAutoSign(root, api);
+  } catch (error) {
+    result = {
+      status: 'failed',
+      points: '',
+      message: error && error.message ? error.message : String(error || '签到失败'),
+      signedAt: new Date().toISOString()
+    };
+  }
+
+  const record = await appendSignRecord(root, api, result);
+  if (result.status === 'success') {
+    showBaiduToast(root.document, `自动签到成功${record.points ? `，积分 +${record.points}` : ''}`, 'success', 9000);
+  } else if (result.status === 'already') {
+    if (!options.quiet) showBaiduToast(root.document, '今日已经签到', 'success', 6000);
+  } else if (!options.quiet) {
+    showBaiduToast(root.document, `自动签到失败：${record.message || '未知错误'}`, 'error', 12000);
+  }
+  refreshSignRecordsDialog(root, api).catch(() => null);
+  return record;
+}
+
+async function performAutoSign(root, api) {
+  const beforeCredit = await fetchCurrentCredit(root, api).catch(() => ({}));
+  const signResponse = await fetchText(root, api.SIGN_URL, { credentials: 'include' });
+  if (isCloudflareChallenge(signResponse.text)) {
+    throw new Error('签到页被 Cloudflare 校验拦截，请在浏览器页面完成校验后重试');
+  }
+  if (api.isSignLoginRequired(signResponse.text)) {
+    throw new Error('当前浏览器未登录论坛，跳过自动签到');
+  }
+  const entry = api.extractSignEntry(signResponse.text);
+  if (entry.alreadySigned) {
+    return {
+      status: 'already',
+      points: '',
+      message: '页面显示今日已签到',
+      signedAt: new Date().toISOString()
+    };
+  }
+  if (!entry.href) throw new Error('未找到签到入口');
+
+  const formUrl = resolveUrl(root, entry.href, signResponse.url || api.SIGN_URL);
+  const formResponse = await fetchText(root, formUrl, { credentials: 'include' });
+  const form = api.parseSignFormHtml(formResponse.text);
+  if (!form) {
+    const status = api.parseSignStatus(formResponse.text);
+    if (status === 'success' || status === 'already') {
+      const afterCredit = await fetchCurrentCredit(root, api).catch(() => ({}));
+      return {
+        status,
+        points: api.parseSignPoints(formResponse.text, beforeCredit, afterCredit),
+        message: status === 'success' ? '签到成功' : '页面显示今日已签到',
+        signedAt: new Date().toISOString()
+      };
+    }
+    throw new Error('未找到签到提交表单');
+  }
+
+  const data = api.buildSignFormData(form);
+  const needsCaptcha = form.fields.some((field) => field && field.name === 'clicaptcha-submit-info');
+  if (needsCaptcha) {
+    data['clicaptcha-submit-info'] = await passSignCaptcha(root, api, formResponse.url || formUrl);
+  }
+  if (form.fields.some((field) => field && field.name === 'fingerprint')) {
+    data.fingerprint = api.computeBrowserFingerprint(root);
+  }
+
+  const submitUrl = resolveUrl(root, form.action || formResponse.url || formUrl, formResponse.url || formUrl);
+  const method = String(form.method || 'post').toLowerCase();
+  const submitOptions = {
+    method: method === 'get' ? 'GET' : 'POST',
+    credentials: 'include',
+    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+  };
+  let finalUrl = submitUrl;
+  if (method === 'get') {
+    const url = new root.URL(submitUrl, root.location.href);
+    Object.entries(data).forEach(([key, value]) => url.searchParams.set(key, value));
+    finalUrl = url.toString();
+  } else {
+    submitOptions.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    submitOptions.body = new root.URLSearchParams(data).toString();
+  }
+
+  const submitResponse = await fetchText(root, finalUrl, submitOptions);
+  const afterCredit = await fetchCurrentCredit(root, api).catch(() => ({}));
+  const combinedText = [submitResponse.text, formResponse.text, signResponse.text].join('\n');
+  const status = api.parseSignStatus(combinedText);
+  const points = api.parseSignPoints(combinedText, beforeCredit, afterCredit);
+  if (status !== 'success' && status !== 'already') {
+    throw new Error(signFailureMessage(api, combinedText, submitResponse.status));
+  }
+  return {
+    status,
+    points,
+    message: status === 'success' ? '签到成功' : '页面显示今日已签到',
+    signedAt: new Date().toISOString()
+  };
+}
+
+async function passSignCaptcha(root, api, referer) {
+  const captchaUrl = `${api.CAPTCHA_IMAGE_URL}?t=${Math.random()}`;
+  const imageResponse = await root.fetch(captchaUrl, {
+    credentials: 'include',
+    referrer: referer || root.location.href
+  });
+  if (!imageResponse.ok) throw new Error(`验证码图片请求失败：HTTP ${imageResponse.status}`);
+  const blob = await imageResponse.blob();
+  const imageData = await readCaptchaImageData(root, blob);
+  const solved = solveSignCaptchaImage(imageData);
+  const payload = api.makeCaptchaCheckPayload(solved.points, solved.moveX, new Date());
+  const checkResponse = await root.fetch(api.CAPTCHA_CHECK_URL, {
+    method: 'POST',
+    credentials: 'include',
+    referrer: referer || root.location.href,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'X-Requested-With': 'XMLHttpRequest'
+    },
+    body: new root.URLSearchParams(payload).toString()
+  });
+  const text = (await checkResponse.text()).trim();
+  if (!/^[0-9a-fA-F]{32}_ok$/.test(text)) {
+    throw new Error(`验证码校验失败：${text.slice(0, 80) || `HTTP ${checkResponse.status}`}`);
+  }
+  return text;
+}
+
+async function fetchText(root, url, options = {}) {
+  const response = await root.fetch(url, options);
+  return {
+    url: response.url || url,
+    status: response.status,
+    ok: response.ok,
+    text: await response.text()
+  };
+}
+
+function resolveUrl(root, url, baseUrl) {
+  return new root.URL(String(url || ''), baseUrl || root.location.href).toString();
+}
+
+function isCloudflareChallenge(text) {
+  return /Just a moment|Enable JavaScript and cookies|cdn-cgi\/challenge-platform/i.test(String(text || ''));
+}
+
+function signFailureMessage(api, text, status) {
+  const source = String(text || '');
+  const plain = source.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (api && typeof api.isSignLoginRequired === 'function') {
+    if (api.isSignLoginRequired(source)) return '当前浏览器未登录论坛';
+  } else if (/请先登录|您需要登录|未登录/.test(plain)) {
+    return '当前浏览器未登录论坛';
+  }
+  if (/验证码|clicaptcha|tncode|位置不正确|行为异常|签名验证失败/.test(plain)) return '验证码校验未通过';
+  if (status && status >= 400) return `签到提交失败：HTTP ${status}`;
+  return plain.slice(0, 80) || '签到提交后未识别成功结果';
+}
+
+async function readSignState(root, api) {
+  return readJsonValue(root, api.SIGN_STATE_KEY, {});
+}
+
+async function writeSignState(root, api, state) {
+  await writeJsonValue(root, api.SIGN_STATE_KEY, state || {});
+}
+
+async function readSignRecords(root, api) {
+  return api.trimSignRecords(await readJsonValue(root, api.SIGN_RECORDS_KEY, []));
+}
+
+async function writeSignRecords(root, api, records) {
+  await writeJsonValue(root, api.SIGN_RECORDS_KEY, api.trimSignRecords(records));
+}
+
+async function appendSignRecord(root, api, result) {
+  const now = new Date(result && result.signedAt || Date.now());
+  const status = result && result.status ? result.status : 'failed';
+  const record = {
+    id: `lwbt-sign-${now.getTime()}`,
+    date: api.signDateKey(now),
+    signedAt: now.toISOString(),
+    status,
+    points: result && result.points ? String(result.points) : '',
+    message: api.cleanText(result && result.message || signStatusLabel(status)).slice(0, 160),
+    pageUrl: root.location && root.location.href || ''
+  };
+  const existing = await readSignRecords(root, api);
+  const deduped = existing.filter((item) => !(item && item.date === record.date && (record.status === 'success' || record.status === 'already') && (item.status === 'success' || item.status === 'already')));
+  const records = api.trimSignRecords([record].concat(deduped));
+  await writeSignRecords(root, api, records);
+  await writeSignState(root, api, {
+    date: record.date,
+    status: record.status,
+    attemptedAt: record.signedAt,
+    points: record.points,
+    message: record.message
+  });
+  return record;
+}
+
+async function readJsonValue(root, key, fallback) {
+  const fallbackStorage = root.localStorage;
+  const raw = typeof GM_getValue === 'function'
+    ? await GM_getValue(key, '')
+    : (fallbackStorage ? fallbackStorage.getItem(key) : '');
+  if (!raw) return fallback;
+  if (typeof raw !== 'string') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+async function writeJsonValue(root, key, value) {
+  const raw = JSON.stringify(value);
+  if (typeof GM_setValue === 'function') {
+    await GM_setValue(key, raw);
+  } else if (root.localStorage) {
+    root.localStorage.setItem(key, raw);
+  }
+}
+
+async function showSignRecordsDialog(root, api) {
+  const records = await readSignRecords(root, api);
+  renderSignRecordsDialog(root, api, records);
+}
+
+async function refreshSignRecordsDialog(root, api) {
+  if (!root.document.querySelector('#lwbt-sign-records')) return;
+  await showSignRecordsDialog(root, api);
+}
+
+function renderSignRecordsDialog(root, api, records) {
+  const document = root.document;
+  let dialog = document.querySelector('#lwbt-sign-records');
+  if (!dialog) {
+    dialog = document.createElement('div');
+    dialog.id = 'lwbt-sign-records';
+    document.body.appendChild(dialog);
+    dialog.addEventListener('click', (event) => {
+      const action = event.target && event.target.dataset && event.target.dataset.action;
+      if (action === 'close') dialog.remove();
+      if (action === 'sign-now') {
+        maybeAutoSign(root, api, { force: true, quiet: false }).catch((error) => {
+          showBaiduToast(document, `自动签到失败：${error.message}`, 'error', 12000);
+        });
+      }
+    });
+  }
+  const rows = records.map((record) => `
+        <tr>
+          <td>${escapeHtml(formatSignDisplayTime(record.signedAt))}</td>
+          <td><span class="lwbt-sign-badge lwbt-sign-${escapeAttr(record.status || 'failed')}">${escapeHtml(api.signStatusLabel(record.status))}</span></td>
+          <td>${escapeHtml(record.points ? `+${record.points}` : '-')}</td>
+          <td>${escapeHtml(record.message || '')}</td>
+        </tr>`).join('');
+  dialog.innerHTML = `
+    <style>${signRecordsCss()}</style>
+    <div class="lwbt-sign-backdrop" data-action="close"></div>
+    <section class="lwbt-sign-dialog" role="dialog" aria-modal="true" aria-label="签到记录">
+      <header>
+        <h2>签到记录</h2>
+        <div class="lwbt-sign-actions">
+          <button type="button" data-action="sign-now">立即签到</button>
+          <button type="button" data-action="close">关闭</button>
+        </div>
+      </header>
+      <p>本地最多保存 ${api.SIGN_RECORD_LIMIT} 条记录。</p>
+      <div class="lwbt-sign-table-wrap">
+        <table>
+          <thead><tr><th>时间</th><th>状态</th><th>积分</th><th>说明</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="4" class="lwbt-sign-empty">暂无签到记录</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>`;
+}
+
+function formatSignDisplayTime(value) {
+  const date = new Date(value || '');
+  if (Number.isNaN(date.getTime())) return '-';
+  return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function signRecordsCss() {
+  return `
+    #lwbt-sign-records{position:fixed;inset:0;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .lwbt-sign-backdrop{position:absolute;inset:0;background:rgba(17,24,39,.52)}
+    .lwbt-sign-dialog{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(760px,calc(100vw - 28px));max-height:min(680px,calc(100vh - 28px));display:flex;flex-direction:column;background:#fff;border-radius:8px;box-shadow:0 24px 80px rgba(15,23,42,.32);overflow:hidden;color:#111827}
+    .lwbt-sign-dialog header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid #e5e7eb;background:#f9fafb}
+    .lwbt-sign-dialog h2{margin:0;font-size:18px;line-height:1.3}
+    .lwbt-sign-dialog p{margin:0;padding:10px 16px;color:#6b7280;font-size:13px}
+    .lwbt-sign-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    .lwbt-sign-actions button{border:0;border-radius:6px;background:#2563eb;color:#fff;font-weight:800;padding:8px 10px;cursor:pointer}
+    .lwbt-sign-actions button+button{background:#e5e7eb;color:#111827}
+    .lwbt-sign-table-wrap{overflow:auto;padding:0 16px 16px}
+    .lwbt-sign-dialog table{width:100%;border-collapse:collapse;font-size:13px}
+    .lwbt-sign-dialog th,.lwbt-sign-dialog td{border-bottom:1px solid #e5e7eb;padding:9px 8px;text-align:left;vertical-align:top}
+    .lwbt-sign-dialog th{position:sticky;top:0;background:#fff;color:#374151;font-weight:900}
+    .lwbt-sign-dialog td:nth-child(1){white-space:nowrap;color:#374151}
+    .lwbt-sign-dialog td:nth-child(3){white-space:nowrap;font-weight:900;color:#166534}
+    .lwbt-sign-empty{text-align:center!important;color:#6b7280!important;padding:26px 8px!important}
+    .lwbt-sign-badge{display:inline-flex;border-radius:999px;padding:3px 8px;font-weight:900;font-size:12px;background:#e5e7eb;color:#374151;white-space:nowrap}
+    .lwbt-sign-success,.lwbt-sign-already{background:#dcfce7;color:#166534}
+    .lwbt-sign-running{background:#dbeafe;color:#1d4ed8}
+    .lwbt-sign-failed{background:#fee2e2;color:#991b1b}
+  `;
+}
+
+async function readCaptchaImageData(root, blob) {
+  const canvas = root.document.createElement('canvas');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) throw new Error('当前浏览器不支持 Canvas 验证码识别');
+  if (typeof root.createImageBitmap === 'function') {
+    const bitmap = await root.createImageBitmap(blob);
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    context.drawImage(bitmap, 0, 0);
+    if (bitmap.close) bitmap.close();
+    return context.getImageData(0, 0, canvas.width, canvas.height);
+  }
+  const image = await loadBlobImage(root, blob);
+  canvas.width = image.naturalWidth || image.width;
+  canvas.height = image.naturalHeight || image.height;
+  context.drawImage(image, 0, 0);
+  return context.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+function loadBlobImage(root, blob) {
+  return new Promise((resolve, reject) => {
+    const url = root.URL.createObjectURL(blob);
+    const image = new root.Image();
+    image.onload = () => {
+      root.URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      root.URL.revokeObjectURL(url);
+      reject(new Error('验证码图片解码失败'));
+    };
+    image.src = url;
+  });
+}
+
+function solveSignCaptchaImage(imageData) {
+  const bands = splitCaptchaBands(imageData);
+  const piece = findCaptchaPiece(imageData, bands.slider);
+  const target = matchCaptchaTarget(imageData, bands.bottom, piece) || findCaptchaDiffTarget(imageData, bands.top, bands.bottom, piece);
+  if (!target) throw new Error('未能识别验证码缺口');
+  const moveX = Math.round(target.x - piece.x);
+  if (!Number.isFinite(moveX) || moveX <= 0) throw new Error(`验证码位移异常：${moveX}`);
+  return {
+    moveX,
+    targetX: target.x,
+    targetY: target.y,
+    points: makeSignHorizontalTrack(moveX)
+  };
+}
+
+function splitCaptchaBands(imageData) {
+  const { width, height } = imageData;
+  const rows = [];
+  for (let y = 0; y < height; y += 1) {
+    let black = 0;
+    for (let x = 0; x < width; x += 1) {
+      if (captchaGray(imageData, x, y) < 25) black += 1;
+    }
+    if (black / width > 0.68) rows.push(y);
+  }
+  if (!rows.length) throw new Error('验证码图片结构异常');
+  let best = [rows[0], rows[0] + 1];
+  let start = rows[0];
+  let prev = rows[0];
+  for (let index = 1; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (row === prev + 1) {
+      prev = row;
+      continue;
+    }
+    if (prev + 1 - start > best[1] - best[0]) best = [start, prev + 1];
+    start = prev = row;
+  }
+  if (prev + 1 - start > best[1] - best[0]) best = [start, prev + 1];
+  if (best[1] - best[0] < 20 || best[0] <= 0 || best[1] >= height) throw new Error('验证码滑块区域异常');
+  return {
+    top: { y: 0, height: best[0] },
+    slider: { y: best[0], height: best[1] - best[0] },
+    bottom: { y: best[1], height: height - best[1] }
+  };
+}
+
+function findCaptchaPiece(imageData, band) {
+  const { width } = imageData;
+  const height = band.height;
+  const visited = new Uint8Array(width * height);
+  let best = null;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (visited[index] || captchaGray(imageData, x, band.y + y) <= 35) continue;
+      const component = floodCaptchaComponent(imageData, band, x, y, visited);
+      if (component.count < 120) continue;
+      const bw = component.maxX - component.minX + 1;
+      const bh = component.maxY - component.minY + 1;
+      if (bw < 12 || bh < 12 || bw > width * 0.55 || bh > height * 0.8) continue;
+      if (!best || component.count > best.count) best = component;
+    }
+  }
+  if (!best) throw new Error('未从验证码中定位滑块');
+  const pad = 2;
+  const x = Math.max(0, best.minX - pad);
+  const y = Math.max(0, best.minY - pad);
+  const w = Math.min(width, best.maxX + pad + 1) - x;
+  const h = Math.min(height, best.maxY + pad + 1) - y;
+  let mask = buildCaptchaPieceMask(imageData, band.y, x, y, w, h, 55, true);
+  if (mask.length < 80) mask = buildCaptchaPieceMask(imageData, band.y, x, y, w, h, 25, false);
+  return {
+    x,
+    y,
+    absoluteY: band.y + y,
+    width: w,
+    height: h,
+    mask: sampleCaptchaMask(mask, 700)
+  };
+}
+
+function floodCaptchaComponent(imageData, band, startX, startY, visited) {
+  const { width } = imageData;
+  const stack = [[startX, startY]];
+  let count = 0;
+  let minX = startX;
+  let maxX = startX;
+  let minY = startY;
+  let maxY = startY;
+  while (stack.length) {
+    const [x, y] = stack.pop();
+    if (x < 0 || y < 0 || x >= width || y >= band.height) continue;
+    const index = y * width + x;
+    if (visited[index]) continue;
+    visited[index] = 1;
+    if (captchaGray(imageData, x, band.y + y) <= 35) continue;
+    count += 1;
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+    stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+  return { count, minX, maxX, minY, maxY };
+}
+
+function buildCaptchaPieceMask(imageData, bandY, pieceX, pieceY, width, height, threshold, removeGreen) {
+  const mask = [];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const px = pieceX + x;
+      const py = bandY + pieceY + y;
+      const offset = (py * imageData.width + px) * 4;
+      const r = imageData.data[offset];
+      const g = imageData.data[offset + 1];
+      const b = imageData.data[offset + 2];
+      const gray = (r + g + b) / 3;
+      const green = removeGreen && g > 80 && g > r * 1.25 && g > b * 1.25;
+      if (gray > threshold && !green) mask.push({ x, y, r, g, b });
+    }
+  }
+  return mask;
+}
+
+function sampleCaptchaMask(mask, maxPoints) {
+  if (mask.length <= maxPoints) return mask;
+  const step = Math.ceil(mask.length / maxPoints);
+  return mask.filter((_point, index) => index % step === 0);
+}
+
+function matchCaptchaTarget(imageData, band, piece) {
+  if (!piece.mask.length || band.height < piece.height) return null;
+  let best = null;
+  for (let y = 0; y <= band.height - piece.height; y += 1) {
+    for (let x = 0; x <= imageData.width - piece.width; x += 1) {
+      let total = 0;
+      for (const point of piece.mask) {
+        const offset = ((band.y + y + point.y) * imageData.width + x + point.x) * 4;
+        const dr = imageData.data[offset] - point.r;
+        const dg = imageData.data[offset + 1] - point.g;
+        const db = imageData.data[offset + 2] - point.b;
+        total += dr * dr + dg * dg + db * db;
+      }
+      const score = 1 - total / (piece.mask.length * 255 * 255 * 3);
+      if (!best || score > best.score) best = { x, y, score };
+    }
+  }
+  return best && best.score > 0.62 ? best : null;
+}
+
+function findCaptchaDiffTarget(imageData, top, bottom, piece) {
+  const height = Math.min(top.height, bottom.height);
+  const width = imageData.width;
+  const visited = new Uint8Array(width * height);
+  let best = null;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (visited[index] || captchaDiffGray(imageData, x, top.y + y, bottom.y + y) <= 30) continue;
+      const component = floodCaptchaDiffComponent(imageData, top, bottom, x, y, visited, height);
+      const bw = component.maxX - component.minX + 1;
+      const bh = component.maxY - component.minY + 1;
+      if (bw < piece.width * 0.35 || bh < piece.height * 0.35 || bw > piece.width * 2.25 || bh > piece.height * 2.0) continue;
+      const sizePenalty = Math.abs(bw - piece.width) / Math.max(piece.width, 1) + Math.abs(bh - piece.height) / Math.max(piece.height, 1);
+      const score = component.count / Math.max(bw * bh, 1) + Math.min(component.count / Math.max(piece.width * piece.height, 1), 2) - sizePenalty * 0.25;
+      if (!best || score > best.score) best = { x: component.minX, y: component.minY, score };
+    }
+  }
+  return best;
+}
+
+function floodCaptchaDiffComponent(imageData, top, bottom, startX, startY, visited, height) {
+  const { width } = imageData;
+  const stack = [[startX, startY]];
+  let count = 0;
+  let minX = startX;
+  let maxX = startX;
+  let minY = startY;
+  let maxY = startY;
+  while (stack.length) {
+    const [x, y] = stack.pop();
+    if (x < 0 || y < 0 || x >= width || y >= height) continue;
+    const index = y * width + x;
+    if (visited[index]) continue;
+    visited[index] = 1;
+    if (captchaDiffGray(imageData, x, top.y + y, bottom.y + y) <= 30) continue;
+    count += 1;
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+    stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+  return { count, minX, maxX, minY, maxY };
+}
+
+function captchaGray(imageData, x, y) {
+  const offset = (y * imageData.width + x) * 4;
+  return (imageData.data[offset] + imageData.data[offset + 1] + imageData.data[offset + 2]) / 3;
+}
+
+function captchaDiffGray(imageData, x, y1, y2) {
+  const offset1 = (y1 * imageData.width + x) * 4;
+  const offset2 = (y2 * imageData.width + x) * 4;
+  return (Math.abs(imageData.data[offset1] - imageData.data[offset2])
+    + Math.abs(imageData.data[offset1 + 1] - imageData.data[offset2 + 1])
+    + Math.abs(imageData.data[offset1 + 2] - imageData.data[offset2 + 2])) / 3;
+}
+
+function makeSignHorizontalTrack(distance) {
+  const total = Math.round(Number(distance) || 0);
+  const startX = 547;
+  const startY = 425;
+  const direction = total >= 0 ? 1 : -1;
+  const dist = Math.abs(total);
+  if (!dist) return [{ x: startX, y: startY, t: 0 }];
+  const steps = Math.max(14, Math.min(42, Math.floor(dist / 3) + 12));
+  const tailPause = randomInt(40, 90);
+  const duration = randomInt(1100, 1999 - tailPause);
+  const points = [{ x: startX, y: startY, t: 0 }];
+  let lastX = 0;
+  let yOffset = 0;
+  for (let index = 1; index <= steps; index += 1) {
+    const p = index / steps;
+    let x = Math.round(dist * (1 - Math.pow(1 - p, 3)));
+    if (x <= lastX) x = Math.min(dist, lastX + 1);
+    if (x > dist) x = dist;
+    const lastPoint = points[points.length - 1];
+    const t = Math.max(lastPoint.t + 8, Math.round(duration * p + randomInt(-8, 8)));
+    yOffset = nextSignYOffset(yOffset);
+    points.push({ x: startX + direction * x, y: startY + yOffset, t });
+    lastX = x;
+    if (lastX >= dist) break;
+  }
+  const finalT = Math.min(1999, Math.max(1001, points[points.length - 1].t + tailPause));
+  yOffset = nextSignYOffset(yOffset);
+  points.push({ x: startX + total, y: startY + yOffset, t: finalT });
+  return points;
+}
+
+function nextSignYOffset(current) {
+  const maxJitter = 5;
+  let offset = current + randomInt(-2, 2);
+  offset = Math.max(-maxJitter, Math.min(maxJitter, offset));
+  if (Math.abs(offset) >= 1) return offset;
+  return (current < 0 ? -1 : (Math.random() < 0.5 ? -1 : 1));
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 function getForumPostRoot(document) {
@@ -1607,7 +2633,7 @@ async function purchaseThenQueueTransfer(root, api, info) {
   if (target.type === 'lookup') {
     setStatus(document, `找到已购买资源入口 ${lookupCount} 个，正在打开资源链接...`);
     target.node.click();
-    const resource = await waitForResource(root, api, 15000);
+    const resource = await waitForResource(root, api, PURCHASE_OPENED_RESOURCE_TIMEOUT_MS);
     if (resource) {
       return openResource(root, api, info, resource);
     }
@@ -1629,24 +2655,24 @@ async function purchaseThenQueueTransfer(root, api, info) {
     console.warn('[LWBT] Direct forum purchase failed, falling back to modal click', directPurchase.error || directPurchase.text);
     setStatus(document, `直接购买未完成，正在回退到论坛弹窗：${target.text || '立即购买'}`);
     purchaseLink.click();
-    if (await waitAndClickForumPurchaseConfirm(root, api, 10000)) {
+    if (await waitAndClickForumPurchaseConfirm(root, api, PURCHASE_CONFIRM_TIMEOUT_MS)) {
       setStatus(document, '已确认论坛购买，正在读取百度链接...');
     } else {
       setStatus(document, '已打开论坛购买窗口，正在等待百度链接...');
     }
   }
-  let resource = await waitForResource(root, api, 12000);
+  let resource = await waitForResource(root, api, PURCHASE_DIRECT_RESOURCE_TIMEOUT_MS);
   if (resource) {
     return openResource(root, api, info, resource);
   }
   setStatus(document, '已购买，正在自动打开资源链接...');
-  let lookupResource = await waitForForumLookupResource(root, api, info, 8000);
+  let lookupResource = await waitForForumLookupResource(root, api, info, PURCHASE_LOOKUP_RESOURCE_TIMEOUT_MS);
   if (lookupResource) {
     return openResource(root, api, info, lookupResource);
   }
-  const lookupTarget = await waitForLookupTarget(root, api, 18000);
+  const lookupTarget = await waitForLookupTarget(root, api, PURCHASE_LOOKUP_TARGET_TIMEOUT_MS);
   if (!lookupTarget) {
-    lookupResource = await waitForForumLookupResource(root, api, info, 12000);
+    lookupResource = await waitForForumLookupResource(root, api, info, PURCHASE_LOOKUP_RESOURCE_TIMEOUT_MS);
     if (lookupResource) {
       return openResource(root, api, info, lookupResource);
     }
@@ -1657,7 +2683,7 @@ async function purchaseThenQueueTransfer(root, api, info) {
     return openResource(root, api, info, lookupTarget.resource);
   }
   lookupTarget.node.click();
-  resource = await waitForResource(root, api, 15000);
+  resource = await waitForResource(root, api, PURCHASE_OPENED_RESOURCE_TIMEOUT_MS);
   if (!resource) {
     setStatus(document, '已打开资源链接，但还没有读取到真实下载链接；请确认弹窗内容');
     return 'waiting';
@@ -1784,7 +2810,7 @@ async function waitForForumLookupShare(root, api, info, timeoutMs) {
   while (Date.now() - started < timeoutMs) {
     const share = await fetchForumLookupShare(root, api, info);
     if (share) return share;
-    await sleep(1200);
+    await sleep(PURCHASE_LOOKUP_POLL_INTERVAL_MS);
   }
   return null;
 }
@@ -1799,7 +2825,7 @@ async function waitForForumLookupResource(root, api, info, timeoutMs) {
   while (Date.now() - started < timeoutMs) {
     const resource = await fetchForumLookupResource(root, api, info);
     if (resource) return resource;
-    await sleep(1200);
+    await sleep(PURCHASE_LOOKUP_POLL_INTERVAL_MS);
   }
   return null;
 }
@@ -1982,19 +3008,19 @@ async function runBaidu(root, api) {
   removeBaiduHints(document);
   const { tasks, active } = await findActiveBaiduTask(root, api);
   if (!active) return;
-  showBaiduToast(document, `准备保存到 ${active.targetPath}`);
+  showBaiduToast(document, `准备保存到 ${active.targetPath}`, 'info');
   try {
     await fillBaiduCodeIfNeeded(root, active);
     await saveBaiduShare(root, active);
     active.status = 'saved';
     active.savedAt = new Date().toISOString();
     await writeTasks(root, api, tasks);
-    showBaiduToast(document, '保存任务已提交');
+    showBaiduToast(document, `保存成功：已保存到 ${active.targetPath}`, 'success', 12000);
   } catch (error) {
     active.status = 'failed';
     active.error = error.message;
     await writeTasks(root, api, tasks);
-    showBaiduToast(document, `自动保存失败：${error.message}，请手动保存`);
+    showBaiduToast(document, `自动保存失败：${error.message}，请手动保存`, 'error', 20000);
   }
 }
 
@@ -2012,20 +3038,43 @@ async function fillBaiduCodeIfNeeded(root, task) {
 
 async function saveBaiduShare(root, task) {
   const document = root.document;
-  await ensureBaiduTargetPath(root, root.LWBT, task.targetPath);
-  await chooseBaiduSavePath(root, task.targetPath);
+  const targetPathReady = await ensureBaiduTargetPath(root, root.LWBT, task.targetPath);
+  if (targetPathReady && await transferBaiduShareToTargetPath(root, root.LWBT, task.targetPath)) {
+    closeBaiduPathDialog(root);
+    return;
+  }
+  await chooseBaiduSavePath(root, task.targetPath, { allowCreate: !targetPathReady });
   if (isBaiduSaveComplete(document)) return;
   const saveButton = findBaiduSaveButton(root);
   if (!saveButton && isBaiduSaveComplete(document)) return;
   if (!saveButton) throw new Error('未找到百度网盘保存按钮');
-  saveButton.click();
+  clickBaiduElement(root, saveButton);
   await waitForBaiduSaveComplete(document, 30000);
 }
 
-async function ensureBaiduTargetPath(root, api, targetPath) {
-  if (!api || !root.fetch) return;
+async function transferBaiduShareToTargetPath(root, api, targetPath) {
+  if (!api || !root.fetch || !api.buildBaiduTransferUrl || !api.buildBaiduTransferBody) return false;
   const token = readBaiduToken(root);
-  if (!token) return;
+  const context = readBaiduShareContext(root, api);
+  if (!token || !context || !context.shareId || !context.from || !context.fsIds || !context.fsIds.length) return false;
+  const response = await root.fetch(api.buildBaiduTransferUrl(context, token, readBaiduSeKey(root)), {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+    },
+    body: api.buildBaiduTransferBody(targetPath, context.fsIds).toString()
+  });
+  const data = await response.json();
+  if (data && data.errno === 0) return true;
+  console.warn('[LWBT] Direct baidu transfer failed, falling back to page save flow', data);
+  return false;
+}
+
+async function ensureBaiduTargetPath(root, api, targetPath) {
+  if (!api || !root.fetch) return false;
+  const token = readBaiduToken(root);
+  if (!token) return false;
   const entries = api.baiduPathEntries(targetPath);
   for (const entry of entries) {
     const existing = await baiduChildFolderExists(root, api, token, entry.parentPath, entry.folderName);
@@ -2033,6 +3082,7 @@ async function ensureBaiduTargetPath(root, api, targetPath) {
     await createBaiduFolder(root, api, token, entry.folderPath);
     await waitForCondition(() => baiduChildFolderExists(root, api, token, entry.parentPath, entry.folderName), 8000, 500);
   }
+  return true;
 }
 
 function stripBaiduTaskParam(root, api) {
@@ -2127,28 +3177,53 @@ async function createBaiduFolder(root, api, token, folderPath) {
   throw new Error(`百度网盘目录创建失败：${folderPath}${data && data.errno !== undefined ? ` errno=${data.errno}` : ''}`);
 }
 
-async function chooseBaiduSavePath(root, targetPath) {
+async function chooseBaiduSavePath(root, targetPath, options = {}) {
   const document = root.document;
-  if (baiduCurrentSavePathMatches(document, targetPath)) return;
+  if (baiduCurrentSavePathMatches(document, targetPath)) {
+    await confirmBaiduPathDialogIfOpen(root);
+    return;
+  }
   const dialog = await openBaiduPathDialog(root);
   const recent = findBaiduRecentPath(dialog, targetPath);
   if (recent) {
-    recent.click();
+    await clickBaiduRecentPath(root, recent);
+    await sleep(300);
   } else {
     const segments = root.LWBT ? root.LWBT.targetPathToSegments(targetPath) : String(targetPath || '').split('/').filter(Boolean);
     if (!segments.length) throw new Error('目标目录为空');
+    let liveDialog = dialog;
     for (const segment of segments) {
-      await selectOrCreateBaiduFolder(root, dialog, segment);
+      liveDialog = document.querySelector('.dialog-fileTreeDialog') || liveDialog;
+      await selectOrCreateBaiduFolder(root, liveDialog, segment, options);
     }
   }
   const liveDialog = document.querySelector('.dialog-fileTreeDialog') || dialog;
-  const confirmButton = findButtonByText(liveDialog, /^确定$/) || liveDialog.querySelector('[node-type="confirm"]');
+  const confirmButton = findBaiduDialogButtonByText(liveDialog, /^确定$/) || liveDialog.querySelector('[node-type="confirm"]');
   if (!confirmButton) throw new Error('未找到百度网盘目录确认按钮');
-  confirmButton.click();
+  clickBaiduElement(root, confirmButton);
   await waitForCondition(() => baiduCurrentSavePathMatches(document, targetPath) || !document.querySelector('.dialog-fileTreeDialog'), 10000);
   if (!baiduCurrentSavePathMatches(document, targetPath)) {
     throw new Error(`目标目录未切换成功：${targetPath}`);
   }
+}
+
+async function confirmBaiduPathDialogIfOpen(root) {
+  const dialog = root.document.querySelector('.dialog-fileTreeDialog');
+  if (!dialog) return false;
+  const confirmButton = findBaiduDialogButtonByText(dialog, /^确定$/) || dialog.querySelector('[node-type="confirm"]');
+  if (!confirmButton) return false;
+  clickBaiduElement(root, confirmButton);
+  await waitForCondition(() => !root.document.querySelector('.dialog-fileTreeDialog'), 5000, 200).catch(() => null);
+  return true;
+}
+
+function closeBaiduPathDialog(root) {
+  const dialog = root.document.querySelector('.dialog-fileTreeDialog');
+  if (!dialog) return false;
+  const closeButton = dialog.querySelector('.dialog-icon, .icon-svg-s-close') || findBaiduDialogButtonByText(dialog, /^取消$/);
+  if (!closeButton) return false;
+  clickBaiduElement(root, closeButton);
+  return true;
 }
 
 async function openBaiduPathDialog(root) {
@@ -2163,12 +3238,16 @@ async function openBaiduPathDialog(root) {
   return waitForSelector(document, '.dialog-fileTreeDialog', 10000);
 }
 
-async function selectOrCreateBaiduFolder(root, dialog, folderName) {
-  const existing = findBaiduTreeNode(dialog, folderName);
+async function selectOrCreateBaiduFolder(root, dialog, folderName, options = {}) {
+  const allowCreate = options.allowCreate !== false;
+  const existing = await waitForBaiduTreeNode(dialog, folderName, allowCreate ? 800 : 2500);
   if (existing) {
     clickBaiduTreeNode(root, existing);
     await sleep(1000);
     return;
+  }
+  if (!allowCreate) {
+    throw new Error(`百度网盘目录未在弹窗中加载：${folderName}，已阻止新建同名目录`);
   }
   const createButton = findButtonByText(dialog, /^新建文件夹$/);
   if (!createButton) throw new Error(`未找到新建文件夹按钮，无法创建：${folderName}`);
@@ -2182,6 +3261,14 @@ async function selectOrCreateBaiduFolder(root, dialog, folderName) {
   if (!created) throw new Error(`百度网盘目录创建后未找到：${folderName}`);
   clickBaiduTreeNode(root, created);
   await sleep(800);
+}
+
+async function waitForBaiduTreeNode(dialog, folderName, timeoutMs) {
+  try {
+    return await waitForCondition(() => findBaiduTreeNode(dialog, folderName), timeoutMs, 200);
+  } catch (_error) {
+    return null;
+  }
 }
 
 function findBaiduTreeNode(dialog, folderName) {
@@ -2201,8 +3288,93 @@ function clickBaiduTreeNode(root, node) {
 }
 
 function findBaiduRecentPath(dialog, targetPath) {
-  const expected = normalizeBaiduPath(targetPath);
-  return Array.from(dialog.querySelectorAll('.save-path-item')).find((node) => normalizeBaiduPath(node.title || node.textContent) === expected) || null;
+  const direct = Array.from(dialog.querySelectorAll('.save-path-item')).find((node) => baiduPathTextMatches(node.title || node.textContent, targetPath));
+  if (direct) return direct;
+  const candidates = Array.from(dialog.querySelectorAll('label, span, div'))
+    .filter((node) => /最近保存路径/.test(node.textContent || '') && baiduPathTextMatches(node.textContent || '', targetPath))
+    .sort((left, right) => cleanNodeText(left).length - cleanNodeText(right).length);
+  if (!candidates.length) return null;
+  return findBaiduRecentPathClickTarget(candidates[0]);
+}
+
+function findBaiduRecentPathClickTarget(node) {
+  let current = node;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    const checkbox = current.querySelector && current.querySelector('input[type="checkbox"], [role="checkbox"]');
+    if (checkbox) return checkbox;
+    if (String(current.tagName || '').toUpperCase() === 'LABEL') return current;
+    current = current.parentElement;
+  }
+  return node;
+}
+
+async function clickBaiduRecentPath(root, node) {
+  if (isBaiduRecentPathChecked(node)) return;
+  clickBaiduElement(root, node);
+  await sleep(120);
+  if (isBaiduRecentPathChecked(node)) return;
+  clickBaiduRecentPathCheckboxPoint(root, node);
+  await sleep(120);
+  if (!isBaiduRecentPathChecked(node)) {
+    clickBaiduElement(root, node);
+  }
+}
+
+function clickBaiduRecentPathCheckboxPoint(root, node) {
+  const document = node.ownerDocument || root.document;
+  const row = findBaiduRecentPathRow(node);
+  const rect = row && row.getBoundingClientRect ? row.getBoundingClientRect() : null;
+  if (!rect || !rect.width || !rect.height) return false;
+  const textRect = node.getBoundingClientRect ? node.getBoundingClientRect() : rect;
+  const x = Math.max(rect.left + 10, Math.min(textRect.left - 16, rect.right - 10));
+  const y = textRect.top + (textRect.height || rect.height) / 2;
+  const target = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
+  clickBaiduElement(root, target || row, x, y);
+  return true;
+}
+
+function findBaiduRecentPathRow(node) {
+  let current = node;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    const text = current.textContent || '';
+    if (/最近保存路径/.test(text) && current.getBoundingClientRect) return current;
+    current = current.parentElement;
+  }
+  return node;
+}
+
+function findBaiduDialogButtonByText(scope, pattern) {
+  const candidates = Array.from(scope.querySelectorAll('button,a,input[type="button"],input[type="submit"],[role="button"],.g-button,[class*="btn"],[class*="button"],span,div'))
+    .filter((node) => {
+      const view = node.ownerDocument && node.ownerDocument.defaultView;
+      return view && isVisible(view, node) && pattern.test(cleanNodeText(node));
+    })
+    .sort((left, right) => cleanNodeText(left).length - cleanNodeText(right).length);
+  if (!candidates.length) return null;
+  const buttonLike = candidates[0].closest && candidates[0].closest('button,a,input[type="button"],input[type="submit"],[role="button"],.g-button,[class*="btn"],[class*="button"]');
+  return buttonLike || candidates[0];
+}
+
+function clickBaiduElement(root, node, clientX, clientY) {
+  if (!node) return;
+  const view = node.ownerDocument && node.ownerDocument.defaultView || root;
+  const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+  const x = Number.isFinite(clientX) ? clientX : (rect ? rect.left + rect.width / 2 : 0);
+  const y = Number.isFinite(clientY) ? clientY : (rect ? rect.top + rect.height / 2 : 0);
+  const MouseEventCtor = view && view.MouseEvent ? view.MouseEvent : root.MouseEvent;
+  ['mousedown', 'mouseup', 'click'].forEach((type) => {
+    node.dispatchEvent(new MouseEventCtor(type, { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+  });
+  if (typeof node.click === 'function') node.click();
+}
+
+function isBaiduRecentPathChecked(node) {
+  if (!node) return false;
+  if (node.checked === true || node.getAttribute && node.getAttribute('aria-checked') === 'true') return true;
+  const marker = String(node.className || '');
+  if (/\b(?:checked|selected|active)\b/i.test(marker)) return true;
+  const input = node.querySelector && node.querySelector('input[type="checkbox"], [role="checkbox"]');
+  return Boolean(input && (input.checked === true || input.getAttribute('aria-checked') === 'true' || /\b(?:checked|selected|active)\b/i.test(String(input.className || ''))));
 }
 
 function findBaiduSaveButton(root) {
@@ -2215,11 +3387,21 @@ function findBaiduSaveButton(root) {
 }
 
 function baiduCurrentSavePathMatches(document, targetPath) {
-  const node = document.querySelector('.save-path');
-  if (!node) return false;
-  const current = normalizeBaiduPath(node.textContent);
+  return Array.from(document.querySelectorAll('.save-path, .bottom-save-path, .bottom_save_path, [class*="save-path"]')).some((node) => {
+    if (node.closest && node.closest('.dialog-fileTreeDialog')) return false;
+    return baiduPathTextMatches(node.textContent || node.title || '', targetPath);
+  });
+}
+
+function baiduPathTextMatches(value, targetPath) {
+  const current = normalizeBaiduPath(value);
   const expected = normalizeBaiduPath(targetPath);
-  return current === expected || current.endsWith(`/${expected}`);
+  if (!current || !expected) return false;
+  return current === expected
+    || current.endsWith(`/${expected}`)
+    || current.includes(`/${expected}`)
+    || current.startsWith(`${expected} `)
+    || current.includes(` ${expected}`);
 }
 
 function normalizeBaiduPath(value) {
@@ -2299,10 +3481,44 @@ function removeBaiduHints(document) {
   document.querySelectorAll('#lwbt-baidu-toast, #lwbt-baidu-path-hint').forEach((node) => node.remove());
 }
 
-function showBaiduToast(document, message) {
+function showBaiduToast(document, message, type = 'info', durationMs = 6000) {
   removeBaiduHints(document);
   if (document.defaultView && document.defaultView.console) {
     document.defaultView.console.info('[LWBT]', message);
+  }
+  if (!document.body) return;
+  const node = document.createElement('div');
+  node.id = 'lwbt-baidu-toast';
+  node.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  node.textContent = message;
+  const palette = {
+    info: { background: '#eff6ff', border: '#2563eb', color: '#1e3a8a' },
+    success: { background: '#ecfdf5', border: '#16a34a', color: '#14532d' },
+    error: { background: '#fef2f2', border: '#dc2626', color: '#7f1d1d' }
+  }[type] || { background: '#eff6ff', border: '#2563eb', color: '#1e3a8a' };
+  node.style.cssText = [
+    'position:fixed',
+    'right:24px',
+    'top:24px',
+    'z-index:2147483647',
+    `background:${palette.background}`,
+    `border:1px solid ${palette.border}`,
+    `border-left:5px solid ${palette.border}`,
+    `color:${palette.color}`,
+    'border-radius:8px',
+    'box-shadow:0 12px 32px rgba(15,23,42,.18)',
+    'font:600 14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+    'max-width:min(460px,calc(100vw - 48px))',
+    'padding:12px 14px',
+    'word-break:break-word',
+    'white-space:pre-wrap'
+  ].join(';');
+  document.body.appendChild(node);
+  const view = document.defaultView;
+  if (view && durationMs > 0) {
+    view.setTimeout(() => {
+      if (node.parentNode) node.remove();
+    }, durationMs);
   }
 }
 
